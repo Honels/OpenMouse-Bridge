@@ -87,11 +87,14 @@ async function main() {
     process.exit(EXIT_NO_DRIVER);
   }
 
+  // The Attack Shark X11 family's settings channel is not visible through
+  // WebHID, but it is reachable over native HID. Polling-only requests take
+  // the verified direct feature-report path below; anything involving DPI
+  // falls through to the generic driver path, where AttackSharkHidClient
+  // drives the 0x04 six-stage table (enabled for model 0x55 in
+  // mouse-protocol #174), preserving the stages the request does not touch.
   if (normalizedBrand === "attack shark" && x11DeviceInfos().length > 0) {
-    if (Number.isFinite(input.dpi)) {
-      throw new Error("Attack Shark X11 native DPI control is not implemented yet; polling-only requests are supported.");
-    }
-    if (Number.isFinite(input.pollingRateHz)) {
+    if (Number.isFinite(input.pollingRateHz) && !Number.isFinite(input.dpi)) {
       applyX11PollingRate(input.pollingRateHz);
       process.exit(EXIT_APPLIED);
     }

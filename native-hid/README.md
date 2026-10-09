@@ -39,12 +39,14 @@ for that brand's vendor id(s) and tries each candidate class directly:
 throw is treated as correct, and `setDpi()`/`setPollingRate()` are called on
 it.
 
-The Attack Shark X11 family is the exception. Its settings channel is not
+The Attack Shark X11 family is the partial exception. Its settings channel is not
 visible through WebHID, so `apply.mjs` first checks for VID `0x1d57`, PIDs
-`0xfa55`/`0xfa60`/`0xfa61`, interface 2 and sends its verified polling feature
-report directly through `node-hid`. This keeps the normal operating-system
-HID driver in place; WinUSB and Zadig are not required. Native X11 DPI support
-is deliberately rejected until its six stages can be read and preserved.
+`0xfa55`/`0xfa60`/`0xfa61`, interface 2: polling-only requests are sent as the
+verified polling feature report directly through `node-hid`. This keeps the normal operating-system
+HID driver in place; WinUSB and Zadig are not required. Requests involving DPI
+fall through to the generic `AttackSharkHidClient` path, which drives the 0x04
+six-stage table for model `0x55` (mouse-protocol #174), preserving the stages
+the request does not touch.
 
 ## Exit code contract (Bridge depends on this — see `src/drivers/native_hid.rs`)
 
@@ -93,7 +95,11 @@ runtime first and falls back to `node` on `PATH`, so local development
 
 - Attack Shark X11 polling was hardware-verified on Windows with the wireless
   PID `0xfa60`, interface 2, using the standard Microsoft HID driver. Switching
-  between 500 Hz and 1000 Hz succeeded without WinUSB or Zadig.
+  between 500 Hz and 1000 Hz succeeded without WinUSB or Zadig. DPI goes
+  through the generic `AttackSharkHidClient` 0x04 path (six-stage table,
+  model `0x55`); the reporter in mouse-protocol #161 confirmed DPI and
+  polling controls working after that fix, with a read-back write round-trip
+  still to be captured.
 - Other adapter and dispatch paths are structurally tested (module resolution,
   exit codes and control flow) and still require validation on their respective
   hardware.
