@@ -1291,9 +1291,7 @@ fn run_server(
                 // The first launch still holds 17846. Ask it to open the panel
                 // instead of exiting with nothing on screen.
                 if activate_running_bridge().await {
-                    tracing::info!(
-                        "OpenMouse Bridge is already running; opening its tray panel"
-                    );
+                    tracing::info!("OpenMouse Bridge is already running; opening its tray panel");
                     let _ = ready.send(Ok(Startup::AlreadyRunning));
                     return Ok(());
                 }
