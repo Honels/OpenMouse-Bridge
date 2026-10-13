@@ -2,13 +2,14 @@ use std::{
     env,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    panic::{self, AssertUnwindSafe},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::overlay::Overlay;
@@ -122,6 +123,12 @@ const DANGER: Color32 = Color32::from_rgb(248, 113, 113);
 const ROW_HEIGHT: f32 = 34.0;
 const MAX_BATTERY_ROWS: usize = 3;
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
+/// Glow/winit often tear down after Windows hibernate. If the tray loop ends
+/// without an Exit or in-app update, spawn a replacement (issue #16).
+const RELAUNCH_ENV: &str = "OPENMOUSE_BRIDGE_RELAUNCH";
+const GUI_STABLE_AFTER: Duration = Duration::from_secs(30);
+const MAX_QUICK_RELAUNCHES: u32 = 5;
+const RELAUNCH_DELAY: Duration = Duration::from_secs(2);
 
 fn toggle_control(ui: &mut egui::Ui, enabled: bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 16.0), Sense::click());
@@ -350,7 +357,7 @@ struct TrayApp {
     visibility_initialized: bool,
     panel_had_focus: bool,
     exit_requested: bool,
-    restart_requested: Arc<AtomicBool>,
+    keep_running: Arc<AtomicBool>,
     autostart: bool,
     battery_threshold: u8,
     automatic_updates: bool,
@@ -366,7 +373,7 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    // Seven tray/runtime handles plus the restart flag: a genuine constructor,
+    // Seven tray/runtime handles plus the persist flag: a genuine constructor,
     // not a helper worth splitting into a params struct for one call site.
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -377,7 +384,7 @@ impl TrayApp {
         notices: Receiver<Notice>,
         panel_requests: Receiver<()>,
         waker: &OnceLock<egui::Context>,
-        restart_requested: Arc<AtomicBool>,
+        keep_running: Arc<AtomicBool>,
         visible: bool,
         acknowledge_tray_hint: bool,
     ) -> Result<Self> {
@@ -439,7 +446,7 @@ impl TrayApp {
             visibility_initialized: false,
             panel_had_focus: false,
             exit_requested: false,
-            restart_requested,
+            keep_running,
             autostart: platform::autostart_enabled(),
             battery_threshold: 20,
             automatic_updates: false,
@@ -568,7 +575,7 @@ impl eframe::App for TrayApp {
         self.refresh_snapshot();
         if self.refresh_updates() {
             // The updater has already spawned its own post-exit relaunch helper.
-            self.restart_requested.store(false, Ordering::Relaxed);
+            self.keep_running.store(false, Ordering::Relaxed);
             self.request_exit(context);
             return;
         }
@@ -594,11 +601,11 @@ impl eframe::App for TrayApp {
                     }
                 }
                 TrayAction::Restart => {
-                    self.restart_requested.store(true, Ordering::Relaxed);
                     self.request_exit(context);
                     break;
                 }
                 TrayAction::Exit => {
+                    self.keep_running.store(false, Ordering::Relaxed);
                     self.request_exit(context);
                     break;
                 }
@@ -971,6 +978,7 @@ impl TrayApp {
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if link_button(ui, "Quit", DANGER) {
+                        self.keep_running.store(false, Ordering::Relaxed);
                         self.request_exit(ui.ctx());
                     }
                 });
@@ -1106,8 +1114,8 @@ pub fn run() -> Result<()> {
     else {
         return Ok(());
     };
-    let restart_requested = Arc::new(AtomicBool::new(false));
-    let app_restart_requested = Arc::clone(&restart_requested);
+    let keep_running = Arc::new(AtomicBool::new(true));
+    let app_keep_running = Arc::clone(&keep_running);
     // The panel stays hidden after the first launch. Until then, and whenever
     // OPENMOUSE_BRIDGE_SHOW_WINDOW is set, open it: a tray-only start looks
     // like nothing happened, and an elevated process's tray icon does not
@@ -1124,40 +1132,105 @@ pub fn run() -> Result<()> {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    let tray_result = eframe::run_native(
-        "OpenMouse Bridge",
-        options,
-        Box::new(move |context| {
-            Ok(Box::new(TrayApp::new(
-                &context.egui_ctx,
-                snapshots,
-                commands,
-                updates,
-                notices,
-                panel_requests,
-                &waker,
-                app_restart_requested,
-                visible,
-                show_panel,
-            )?))
-        }),
-    )
-    .map_err(|error| anyhow!(error.to_string()));
+    let gui_started = Instant::now();
+    let tray_result = match panic::catch_unwind(AssertUnwindSafe(|| {
+        eframe::run_native(
+            "OpenMouse Bridge",
+            options,
+            Box::new(move |context| {
+                Ok(Box::new(TrayApp::new(
+                    &context.egui_ctx,
+                    snapshots,
+                    commands,
+                    updates,
+                    notices,
+                    panel_requests,
+                    &waker,
+                    app_keep_running,
+                    visible,
+                    show_panel,
+                )?))
+            }),
+        )
+        .map_err(|error| error.to_string())
+    })) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow!(error)),
+        Err(payload) => {
+            let error = panic_message(&payload);
+            tracing::error!(%error, "OpenMouse Bridge tray panel panicked");
+            Err(anyhow!("tray panel panicked: {error}"))
+        }
+    };
     let server_result = server.stop();
-    tray_result.and(server_result)?;
-    if restart_requested.load(Ordering::Relaxed) {
-        restart_bridge()?;
+    if let Err(error) = &tray_result {
+        tracing::error!(%error, "OpenMouse Bridge tray panel stopped");
     }
+    if let Err(error) = &server_result {
+        tracing::error!(%error, "OpenMouse Bridge runtime stopped");
+    }
+    if let Some(generation) = next_relaunch_generation(
+        current_relaunch_generation(),
+        gui_started.elapsed(),
+        keep_running.load(Ordering::Relaxed),
+    ) {
+        if tray_result.is_err() {
+            thread::sleep(RELAUNCH_DELAY);
+        }
+        tracing::info!(
+            generation,
+            "Relaunching OpenMouse Bridge after the tray panel stopped"
+        );
+        restart_bridge(generation)?;
+        return Ok(());
+    }
+    tray_result.and(server_result)?;
     Ok(())
 }
 
-fn restart_bridge() -> Result<()> {
+fn current_relaunch_generation() -> u32 {
+    env::var(RELAUNCH_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// After Glow/winit die (common on Windows hibernate), replace this process
+/// unless the user quit or an in-app update is already relaunching. Quick
+/// crash loops stop after `MAX_QUICK_RELAUNCHES`; a panel that stayed up
+/// for `GUI_STABLE_AFTER` resets the counter.
+fn next_relaunch_generation(current: u32, gui_lived: Duration, keep_running: bool) -> Option<u32> {
+    if !keep_running {
+        return None;
+    }
+    let generation = if gui_lived >= GUI_STABLE_AFTER {
+        0
+    } else {
+        current.saturating_add(1)
+    };
+    (generation <= MAX_QUICK_RELAUNCHES).then_some(generation)
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_owned())
+        })
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+fn restart_bridge(generation: u32) -> Result<()> {
     let executable = env::current_exe().context("could not locate the Bridge executable")?;
     let working_directory = executable
         .parent()
         .context("Bridge executable has no parent directory")?;
     std::process::Command::new(&executable)
         .current_dir(working_directory)
+        .env(RELAUNCH_ENV, generation.to_string())
         .spawn()
         .context("could not restart OpenMouse Bridge")?;
     Ok(())
@@ -1448,4 +1521,38 @@ fn open_url(url: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_exit_does_not_relaunch() {
+        assert_eq!(
+            next_relaunch_generation(0, Duration::from_secs(5), false),
+            None
+        );
+    }
+
+    #[test]
+    fn unexpected_gui_exit_relaunches() {
+        assert_eq!(
+            next_relaunch_generation(0, Duration::from_secs(5), true),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_stable_gui_resets_the_relaunch_counter() {
+        assert_eq!(next_relaunch_generation(4, GUI_STABLE_AFTER, true), Some(0));
+    }
+
+    #[test]
+    fn quick_crash_loops_stop_relaunching() {
+        assert_eq!(
+            next_relaunch_generation(MAX_QUICK_RELAUNCHES, Duration::from_secs(1), true),
+            None
+        );
+    }
 }
