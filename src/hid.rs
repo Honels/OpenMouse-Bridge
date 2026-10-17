@@ -2,11 +2,11 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError,
+        Arc, Mutex, Once, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use axum::extract::ws::{Message, WebSocket};
@@ -24,6 +24,11 @@ const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2
 const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
+const RESUME_WATCH_STEP: Duration = Duration::from_secs(2);
+/// A step that overshoots by this much means the machine was suspended.
+const RESUME_GAP_THRESHOLD: Duration = Duration::from_secs(15);
+const RESUME_REOPEN_ATTEMPTS: u32 = 8;
+const RESUME_REOPEN_DELAY: Duration = Duration::from_secs(1);
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 /// Monotonic touch order for open HID devices, so the most recently opened
@@ -365,6 +370,14 @@ struct OpenDevice {
 }
 
 impl OpenDevice {
+    /// True when a listener was started and every reader thread has exited
+    /// without being asked to stop.
+    fn readers_died(&self) -> bool {
+        self.listening
+            && !self.readers.is_empty()
+            && self.readers.iter().all(thread::JoinHandle::is_finished)
+    }
+
     fn stop_reader(&mut self) {
         if let Some(stop) = self.stop.take() {
             stop.store(true, Ordering::Release);
@@ -432,23 +445,31 @@ impl HidSession {
                 report_id,
                 data,
             } => self
-                .send_report(&device, report_id, data, false)
+                .with_recovery(&device, |session| {
+                    session.send_report(&device, report_id, data.clone(), false)
+                })
                 .map(|()| Reply::ok(id)),
             Command::SendFeatureReport {
                 device,
                 report_id,
                 data,
             } => self
-                .send_report(&device, report_id, data, true)
+                .with_recovery(&device, |session| {
+                    session.send_report(&device, report_id, data.clone(), true)
+                })
                 .map(|()| Reply::ok(id)),
             Command::ReceiveFeatureReport { device, report_id } => self
-                .receive_feature_report(&device, report_id)
+                .with_recovery(&device, |session| {
+                    session.receive_feature_report(&device, report_id)
+                })
                 .map(|data| Reply {
                     data: Some(data),
                     ..Reply::ok(id)
                 }),
             Command::ReceiveInputReport { device, report_id } => self
-                .receive_input_report(&device, report_id)
+                .with_recovery(&device, |session| {
+                    session.receive_input_report(&device, report_id)
+                })
                 .map(|data| Reply {
                     data: Some(data),
                     ..Reply::ok(id)
@@ -586,6 +607,15 @@ impl HidSession {
     }
 
     fn open(&mut self, key: &str) -> Result<(), String> {
+        if self
+            .open_devices
+            .get(key)
+            .is_some_and(OpenDevice::readers_died)
+        {
+            // Every reader exited on an I/O error: the handles are dead
+            // (typically after hibernate re-enumerated USB).
+            return self.recover(key);
+        }
         if self.open_devices.contains_key(key) {
             // Re-selecting an already-open device still makes it the current
             // one for status purposes.
@@ -643,6 +673,90 @@ impl HidSession {
             note_device_opened(self.session_id, &candidate.summary);
         }
         Ok(())
+    }
+
+    /// Runs a device I/O operation, and when the handle turns out to be dead
+    /// (USB re-enumerated after hibernate/resume) re-resolves the device,
+    /// reopens it, and retries once.
+    fn with_recovery<T>(
+        &mut self,
+        key: &str,
+        mut operation: impl FnMut(&Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let error = match operation(self) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !self.open_devices.contains_key(key) || !error.starts_with("could not ") {
+            return Err(error);
+        }
+        tracing::warn!(
+            session_id = self.session_id,
+            device_key = key,
+            %error,
+            "HID I/O failed; re-enumerating and reopening the device"
+        );
+        if let Err(recover_error) = self.recover(key) {
+            return Err(format!("{error} (reopen failed: {recover_error})"));
+        }
+        operation(self)
+    }
+
+    /// After a resume every pre-suspend handle is dead and USB may still be
+    /// re-enumerating, so reopen each open device, waiting briefly for it to
+    /// reappear. Listeners are kept so readers restart on the new handles.
+    fn handle_resume(&mut self) {
+        let keys = self.open_devices.keys().cloned().collect::<Vec<_>>();
+        if keys.is_empty() {
+            let _ = self.api.refresh_devices();
+            return;
+        }
+        for key in keys {
+            for attempt in 1..=RESUME_REOPEN_ATTEMPTS {
+                match self.recover(&key) {
+                    Ok(()) => break,
+                    Err(error) if attempt == RESUME_REOPEN_ATTEMPTS => {
+                        tracing::warn!(
+                            session_id = self.session_id,
+                            device_key = %key,
+                            %error,
+                            "HID device did not return after resume"
+                        );
+                    }
+                    Err(_) => thread::sleep(RESUME_REOPEN_DELAY),
+                }
+            }
+        }
+    }
+
+    /// Drops the device's handles, re-enumerates, rebuilds its paths from the
+    /// fresh inventory, and reopens it.
+    fn recover(&mut self, key: &str) -> Result<(), String> {
+        self.close(key)?;
+        self.api
+            .refresh_devices()
+            .map_err(|error| format!("could not refresh HID devices: {error}"))?;
+        let identity = self
+            .device_keys
+            .iter()
+            .find(|(_, device_key)| device_key.as_str() == key)
+            .map(|(identity, _)| identity.clone())
+            .ok_or_else(|| "the selected HID interface is no longer available".to_owned())?;
+        let infos = self
+            .api
+            .device_list()
+            .filter(|info| device_group_key(info) == identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        if infos.is_empty() {
+            self.listeners.remove(key);
+            self.candidates.remove(key);
+            self.device_keys.remove(&identity);
+            return Err("the HID device is no longer connected".into());
+        }
+        let candidate = inspect_candidate(&self.api, key.to_owned(), &infos)?;
+        self.candidates.insert(key.to_owned(), candidate);
+        self.open(key)
     }
 
     fn close(&mut self, key: &str) -> Result<(), String> {
@@ -1205,6 +1319,38 @@ fn build_collection(index: usize, nodes: &[CollectionNode]) -> CollectionInfo {
     info
 }
 
+/// Bumped each time the machine resumes from sleep or hibernate.
+static RESUME_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RESUME_WATCH: Once = Once::new();
+
+/// A thread that sleeps in short steps can only wake late if the whole machine
+/// was suspended, so a wall-clock jump well past the step means a resume. This
+/// works the same on every platform without a hidden window or suspend hook.
+fn start_resume_watch() {
+    RESUME_WATCH.call_once(|| {
+        let spawned = thread::Builder::new()
+            .name("openmouse-resume-watch".into())
+            .spawn(|| {
+                let mut last = SystemTime::now();
+                loop {
+                    thread::sleep(RESUME_WATCH_STEP);
+                    let now = SystemTime::now();
+                    if now
+                        .duration_since(last)
+                        .is_ok_and(|gap| gap >= RESUME_GAP_THRESHOLD)
+                    {
+                        tracing::info!("System resume detected; HID handles will be reopened");
+                        RESUME_GENERATION.fetch_add(1, Ordering::AcqRel);
+                    }
+                    last = now;
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start the resume watcher");
+        }
+    });
+}
+
 /// Whether the control panel currently has a HID websocket open. Bridge treats
 /// that as a connected client, and background device reads stay off the
 /// hardware meanwhile so they never interleave with the panel's traffic.
@@ -1231,6 +1377,9 @@ pub async fn serve(mut socket: WebSocket) {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let _active = ActiveSessionGuard::new();
     tracing::info!(session_id, "HID websocket connected");
+    start_resume_watch();
+    let mut resume_seen = RESUME_GENERATION.load(Ordering::Acquire);
+    let mut resume_tick = tokio::time::interval(Duration::from_secs(1));
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let session = match HidSession::new(session_id, input_tx) {
         Ok(session) => Arc::new(Mutex::new(session)),
@@ -1277,6 +1426,19 @@ pub async fn serve(mut socket: WebSocket) {
                     }
                 };
                 if send_json(&mut socket, &reply).await.is_err() { break; }
+            }
+            _ = resume_tick.tick() => {
+                let generation = RESUME_GENERATION.load(Ordering::Acquire);
+                if generation != resume_seen {
+                    resume_seen = generation;
+                    let worker = Arc::clone(&session);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        worker
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .handle_resume();
+                    }).await;
+                }
             }
             report = input_rx.recv() => {
                 let Some(report) = report else { break };
