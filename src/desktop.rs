@@ -49,11 +49,26 @@ fn headless_requested() -> bool {
 fn gui_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some()
+        (env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some())
+            && gtk_ready()
     }
     #[cfg(not(target_os = "linux"))]
     {
         true
+    }
+}
+
+/// The tray menu is built with GTK, which panics on first use unless it was
+/// initialised on this thread. If it cannot start there is no tray, so Bridge
+/// runs headless instead of crash-looping (issue #26).
+#[cfg(target_os = "linux")]
+fn gtk_ready() -> bool {
+    match gtk::init() {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "GTK could not start");
+            false
+        }
     }
 }
 
@@ -1094,7 +1109,7 @@ pub fn run() -> Result<()> {
     if headless_requested() || !gui_available() {
         if !headless_requested() {
             tracing::warn!(
-                "no display found (set WAYLAND_DISPLAY or DISPLAY for the tray panel); running headless: HTTP API, HID, and game profiles still work"
+                "no usable display for the tray panel (set WAYLAND_DISPLAY or DISPLAY, and GTK must start); running headless: HTTP API, HID, and game profiles still work"
             );
         }
         let Some((server, snapshots, commands, updates, _panel_requests, _show_panel)) =

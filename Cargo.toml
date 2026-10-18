@@ -43,6 +43,8 @@ vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_
 tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# tray-icon's GTK menu needs gtk::init() on the main thread before it is built.
+gtk = "0.18"
 # X11 overlay banner and foreground-window lookup. Pure Rust; no system
 # libraries beyond what eframe/tray-icon already require.
 x11rb = "0.13"

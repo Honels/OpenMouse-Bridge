@@ -2935,6 +2935,7 @@ dependencies = [
  "directories",
  "eframe",
  "epaint_default_fonts",
+ "gtk",
  "hidapi",
  "notify-rust",
  "objc2 0.6.4",
