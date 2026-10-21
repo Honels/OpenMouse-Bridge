@@ -9,7 +9,7 @@ use std::{
         mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::overlay::Overlay;
@@ -126,6 +126,7 @@ const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
 /// Glow/winit often tear down after Windows hibernate. If the tray loop ends
 /// without an Exit or in-app update, spawn a replacement (issue #16).
 const RELAUNCH_ENV: &str = "OPENMOUSE_BRIDGE_RELAUNCH";
+const RESUME_GAP: Duration = Duration::from_secs(10);
 const GUI_STABLE_AFTER: Duration = Duration::from_secs(30);
 const MAX_QUICK_RELAUNCHES: u32 = 5;
 const RELAUNCH_DELAY: Duration = Duration::from_secs(2);
@@ -277,8 +278,19 @@ enum TrayAction {
 }
 
 struct TrayState {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    menu: Menu,
     events: Receiver<TrayAction>,
+}
+
+fn build_tray_icon(menu: &Menu) -> Result<TrayIcon> {
+    TrayIconBuilder::new()
+        .with_tooltip("OpenMouse Bridge")
+        .with_icon(tray_icon().context("could not create the tray icon image")?)
+        .with_menu(Box::new(menu.clone()))
+        .with_menu_on_left_click(false)
+        .build()
+        .context("could not create the system tray icon")
 }
 
 impl TrayState {
@@ -293,13 +305,7 @@ impl TrayState {
         let restart_id = restart_item.id().clone();
         let exit_id = exit_item.id().clone();
 
-        let icon = TrayIconBuilder::new()
-            .with_tooltip("OpenMouse Bridge")
-            .with_icon(tray_icon().context("could not create the tray icon image")?)
-            .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
-            .build()
-            .context("could not create the system tray icon")?;
+        let icon = build_tray_icon(&menu)?;
 
         let (event_tx, events) = mpsc::channel();
         let tray_event_tx = event_tx.clone();
@@ -332,10 +338,14 @@ impl TrayState {
             menu_repaint.request_repaint();
         }));
 
-        Ok(Self {
-            _icon: icon,
-            events,
-        })
+        Ok(Self { icon, menu, events })
+    }
+
+    /// Windows can drop the notification-area icon across sleep/hibernate
+    /// while the process keeps running; add a fresh one.
+    fn recreate_icon(&mut self) -> Result<()> {
+        self.icon = build_tray_icon(&self.menu)?;
+        Ok(())
     }
 
     fn next_action(&self) -> Option<TrayAction> {
@@ -367,6 +377,7 @@ struct TrayApp {
     // saved value; it is saved once released.
     adjusting_volume: bool,
     tray_rect: Option<TrayRect>,
+    last_tick: SystemTime,
     panel_requests: Receiver<()>,
     update_state: UpdateState,
     last_error: Option<String>,
@@ -454,6 +465,7 @@ impl TrayApp {
             notification_volume: 60,
             adjusting_volume: false,
             tray_rect: None,
+            last_tick: SystemTime::now(),
             panel_requests,
             update_state: UpdateState::Idle,
             last_error: None,
@@ -572,6 +584,7 @@ impl TrayApp {
 
 impl eframe::App for TrayApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.restore_tray_after_resume();
         self.refresh_snapshot();
         if self.refresh_updates() {
             // The updater has already spawned its own post-exit relaunch helper.
@@ -641,6 +654,20 @@ impl eframe::App for TrayApp {
 }
 
 impl TrayApp {
+    /// `logic` runs at least once a second, so a long wall-clock gap means the
+    /// PC slept or hibernated; the tray icon may be gone after that.
+    fn restore_tray_after_resume(&mut self) {
+        let now = SystemTime::now();
+        let previous = std::mem::replace(&mut self.last_tick, now);
+        let Some(gap) = resume_gap(previous, now) else {
+            return;
+        };
+        tracing::info!(?gap, "Resumed from sleep; recreating the tray icon");
+        if let Err(error) = self.tray.recreate_icon() {
+            tracing::error!(%error, "could not recreate the tray icon after resume");
+        }
+    }
+
     fn home_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.set_height(24.0);
@@ -1188,6 +1215,14 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// The time since `previous` when it is long enough that the PC must have
+/// slept; a backwards clock change is not a resume.
+fn resume_gap(previous: SystemTime, now: SystemTime) -> Option<Duration> {
+    now.duration_since(previous)
+        .ok()
+        .filter(|gap| *gap >= RESUME_GAP)
+}
+
 fn current_relaunch_generation() -> u32 {
     env::var(RELAUNCH_ENV)
         .ok()
@@ -1546,6 +1581,31 @@ mod tests {
     #[test]
     fn a_stable_gui_resets_the_relaunch_counter() {
         assert_eq!(next_relaunch_generation(4, GUI_STABLE_AFTER, true), Some(0));
+    }
+
+    #[test]
+    fn normal_ticks_are_not_a_resume() {
+        let now = SystemTime::now();
+        assert_eq!(resume_gap(now - Duration::from_secs(1), now), None);
+        assert_eq!(resume_gap(now - Duration::from_secs(5), now), None);
+    }
+
+    #[test]
+    fn a_long_gap_is_a_resume() {
+        let now = SystemTime::now();
+        let slept = Duration::from_secs(3600);
+        assert_eq!(resume_gap(now - slept, now), Some(slept));
+        assert_eq!(
+            resume_gap(now - RESUME_GAP, now),
+            Some(RESUME_GAP),
+            "the threshold itself counts"
+        );
+    }
+
+    #[test]
+    fn a_clock_set_backwards_is_not_a_resume() {
+        let now = SystemTime::now();
+        assert_eq!(resume_gap(now + Duration::from_secs(3600), now), None);
     }
 
     #[test]
