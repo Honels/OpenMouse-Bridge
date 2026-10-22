@@ -254,6 +254,7 @@ enum BridgeCommand {
     CheckForUpdates,
     InstallUpdate(UpdateInfo),
     AcknowledgeTrayHint,
+    ForgetBattery(String),
 }
 
 enum Startup {
@@ -774,7 +775,21 @@ impl TrayApp {
                     };
                     // Battery history can belong to a different mouse than
                     // the active HID device, even when there is only one row.
-                    value_row(ui, &battery.device_name, &value, color);
+                    if battery.stale {
+                        row(ui, &battery.device_name, |ui| {
+                            if link_button(ui, "Remove", MUTED) {
+                                let _ = self
+                                    .commands
+                                    .send(BridgeCommand::ForgetBattery(battery.device_id.clone()));
+                            }
+                            ui.add(
+                                egui::Label::new(RichText::new(&value).size(12.0).color(color))
+                                    .truncate(),
+                            );
+                        });
+                    } else {
+                        value_row(ui, &battery.device_name, &value, color);
+                    }
                     divider(ui);
                 }
             }
@@ -1397,6 +1412,9 @@ fn run_server(
                     }
                     BridgeCommand::InstallUpdate(update) => {
                         install_update(update, &update_events).await;
+                    }
+                    BridgeCommand::ForgetBattery(device_id) => {
+                        command_service.forget_battery(&device_id).await;
                     }
                     BridgeCommand::AcknowledgeTrayHint => {
                         if let Err(error) = command_service.acknowledge_tray_hint().await {

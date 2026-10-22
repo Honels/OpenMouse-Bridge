@@ -5,7 +5,7 @@ use axum::{
     body::Body,
     extract::{Path, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
-    routing::{get, put},
+    routing::{delete, get, put},
 };
 use serde::{Deserialize, Serialize};
 use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
@@ -53,7 +53,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
     );
     let cors = CorsLayer::new()
         .allow_origin(allowed)
-        .allow_methods([Method::GET, Method::PUT])
+        .allow_methods([Method::GET, Method::PUT, Method::DELETE])
         .allow_headers([axum::http::header::CONTENT_TYPE])
         .max_age(Duration::from_secs(3600));
     Router::new()
@@ -67,6 +67,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/native/settings", put(apply_native_settings))
         .route("/v1/battery", put(record_battery))
+        .route("/v1/battery/{device_id}", delete(forget_battery))
         .route("/v1/autostart", put(set_autostart))
         .route("/v1/panel", put(show_panel))
         .merge(hid_route)
@@ -178,6 +179,14 @@ async fn record_battery(
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiResult { ok: true }))
+}
+
+async fn forget_battery(
+    State(service): State<BridgeService>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResult> {
+    service.forget_battery(&device_id).await;
+    Json(ApiResult { ok: true })
 }
 
 async fn set_autostart(
