@@ -78,6 +78,22 @@ const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A reading older than this is shown as stale: more than two missed polls.
 const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
 
+/// A reading this old belongs to a mouse that is gone, not just asleep: it is
+/// dropped from the list instead of lingering as a ghost device.
+const BATTERY_EVICT_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Drops battery entries that can no longer describe a live mouse: anything
+/// past `BATTERY_EVICT_AFTER`, and anything outside the saved profiles that
+/// has also gone stale (a renamed or removed device, or an id a client pushed
+/// once and never again).
+fn prune_batteries(battery: &mut HashMap<String, BatteryState>, known: &[(String, String)]) {
+    battery.retain(|device_id, entry| {
+        let age = entry.updated_at.elapsed();
+        age < BATTERY_EVICT_AFTER
+            && (age < BATTERY_STALE_AFTER || known.iter().any(|(id, _)| id == device_id))
+    });
+}
+
 /// The distinct devices named by the saved profiles, as `(id, name)`.
 fn profile_devices(config: &BridgeConfig) -> Vec<(String, String)> {
     let mut devices: Vec<(String, String)> = Vec::new();
@@ -431,6 +447,7 @@ impl BridgeService {
         let mut batteries = state
             .battery
             .iter()
+            .filter(|(_, entry)| entry.updated_at.elapsed() < BATTERY_EVICT_AFTER)
             .map(|(device_id, entry)| DeviceBattery {
                 device_id: device_id.clone(),
                 device_name: entry.device_name.clone(),
@@ -588,6 +605,12 @@ impl BridgeService {
         config::save(&self.config_path, &config)
     }
 
+    /// Forgets a lingering battery entry so a dead device leaves the list.
+    /// Returns whether an entry was removed.
+    pub async fn forget_battery(&self, device_id: &str) -> bool {
+        self.inner.write().await.battery.remove(device_id).is_some()
+    }
+
     pub async fn record_battery(&self, reading: BatteryReading) -> Result<bool> {
         let percent = reading.percent.min(100);
         let mut reading = reading;
@@ -646,6 +669,7 @@ impl BridgeService {
                     continue;
                 }
                 let devices = profile_devices(&service.inner.read().await.config);
+                prune_batteries(&mut service.inner.write().await.battery, &devices);
                 for (device_id, device_name) in devices {
                     let id = device_id.clone();
                     let outcome =
@@ -1055,6 +1079,70 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    fn battery_entry(age: Duration) -> BatteryState {
+        BatteryState {
+            last_alert: None,
+            device_name: "Mouse".into(),
+            percent: 50,
+            charging: false,
+            updated_at: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn prune_evicts_old_entries_and_unknown_stale_ones() {
+        let mut battery = HashMap::new();
+        battery.insert("fresh-unknown".to_string(), battery_entry(Duration::ZERO));
+        battery.insert(
+            "stale-known".to_string(),
+            battery_entry(BATTERY_STALE_AFTER),
+        );
+        battery.insert(
+            "stale-unknown".to_string(),
+            battery_entry(BATTERY_STALE_AFTER),
+        );
+        battery.insert(
+            "ancient-known".to_string(),
+            battery_entry(BATTERY_EVICT_AFTER),
+        );
+        let known = vec![
+            ("stale-known".to_string(), "Mouse".to_string()),
+            ("ancient-known".to_string(), "Mouse".to_string()),
+        ];
+
+        prune_batteries(&mut battery, &known);
+
+        let mut kept = battery.keys().cloned().collect::<Vec<_>>();
+        kept.sort();
+        assert_eq!(kept, ["fresh-unknown", "stale-known"]);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_battery_removes_only_that_device() {
+        let bridge = service(BridgeConfig::default());
+        for id in ["a", "b"] {
+            bridge
+                .record_battery(BatteryReading {
+                    device_id: id.into(),
+                    device_name: id.into(),
+                    percent: 80,
+                    charging: false,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(bridge.forget_battery("a").await);
+        assert!(!bridge.forget_battery("a").await);
+        let ids = bridge
+            .snapshot()
+            .await
+            .batteries
+            .into_iter()
+            .map(|battery| battery.device_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["b"]);
     }
 
     #[test]
