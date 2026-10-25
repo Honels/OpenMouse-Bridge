@@ -203,7 +203,7 @@ write_udev_rule() {
 # Writes the XDG autostart entry Bridge itself uses (see src/platform/linux.rs).
 desktop_exec() {
     local value="$1" character index
-    [[ "$value" != *[$'\001'-$'\037'$'\177']* ]] || return 1
+    [[ "$value" != *[=$'\001'-$'\037'$'\177']* ]] || return 1
     for ((index=0; index<${#value}; index++)); do
         character="${value:index:1}"
         case "$character" in

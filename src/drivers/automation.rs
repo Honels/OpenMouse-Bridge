@@ -79,6 +79,7 @@ impl ManualIntent {
 pub(crate) struct NativeAutomation {
     entries: HashMap<String, Entry>,
     attempted: Option<ApplicationProfile>,
+    apply_deferred: bool,
     apply_error: Option<String>,
     observed_manual: ManualIntent,
 }
@@ -168,7 +169,17 @@ impl NativeAutomation {
                 }
             }
         }
-        if desired != self.attempted.as_ref() {
+        let needs_apply = desired != self.attempted.as_ref() || self.apply_deferred;
+        let blocked = needs_apply
+            && desired.is_some_and(|profile| match self.entries.get(&profile.device.id) {
+                Some(entry) => entry.failed,
+                None => self.entries.len() >= 64,
+            });
+        if blocked {
+            self.apply_deferred = true;
+            self.apply_error = Some("native apply deferred until restoration completes".into());
+        } else if needs_apply {
+            self.apply_deferred = false;
             self.attempted = desired.cloned();
             self.apply_error = None;
             if let Some(profile) = desired {
