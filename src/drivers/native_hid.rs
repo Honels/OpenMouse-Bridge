@@ -24,6 +24,8 @@ use crate::config::ApplicationProfile;
 /// per-candidate probe timeouts (a few seconds each, for a handful of HID
 /// interfaces at most).
 const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+const HELPER_INPUT_LIMIT: usize = 4096;
+const HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 const EXIT_OK: i32 = 0;
 const EXIT_NO_DRIVER: i32 = 3;
@@ -114,11 +116,46 @@ fn parse_battery(reply: StatusReply) -> Option<NativeBattery> {
     })
 }
 
+#[cfg(test)]
+pub(super) type TestHelper = Box<dyn FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HELPER: std::cell::RefCell<Option<TestHelper>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_test_helper<R>(helper: TestHelper, operation: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_HELPER.with(|helper| *helper.borrow_mut() = None);
+        }
+    }
+    TEST_HELPER.with(|slot| *slot.borrow_mut() = Some(helper));
+    let _reset = Reset;
+    operation()
+}
+
 /// Runs `apply.mjs` with `request` on stdin. Returns its stdout on success,
 /// `None` when it has no driver for the brand, and `Err` otherwise.
-fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
+pub(super) fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
+    #[cfg(test)]
+    if let Some(result) = TEST_HELPER.with(|helper| {
+        helper
+            .borrow_mut()
+            .as_mut()
+            .map(|helper| helper(&serde_json::to_value(request)?))
+    }) {
+        return result;
+    }
+
     let script = locate_apply_script()?;
     let payload = serde_json::to_vec(request).context("could not encode the native-hid request")?;
+
+    if payload.len() > HELPER_INPUT_LIMIT {
+        bail!("native-hid request exceeds the input limit");
+    }
 
     let node = locate_node_binary();
     let mut command = Command::new(node.as_deref().unwrap_or_else(|| Path::new("node")));
@@ -129,7 +166,7 @@ fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
-    let mut child = command.spawn().with_context(|| match &node {
+    let child = command.spawn().with_context(|| match &node {
         Some(bundled) => format!(
             "could not start the bundled Node.js runtime at {}",
             bundled.display()
@@ -140,16 +177,7 @@ fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
         ),
     })?;
 
-    // Dropping the returned handle after this write closes stdin, which is
-    // how apply.mjs's stdin-read loop knows the request is complete.
-    child
-        .stdin
-        .take()
-        .context("the native-hid helper's stdin was unavailable")?
-        .write_all(&payload)
-        .context("could not send the request to the native-hid helper")?;
-
-    let output = wait_with_timeout(child, HELPER_TIMEOUT)?;
+    let output = wait_with_timeout(child, payload, HELPER_TIMEOUT)?;
     match output.status.code() {
         Some(EXIT_OK) => Ok(Some(output.stdout)),
         Some(EXIT_NO_DRIVER) => Ok(None),
@@ -203,47 +231,113 @@ fn installed_native_hid_dir() -> Option<PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("native-hid"))
 }
 
-/// Waits for the child with a hard deadline, killing it if exceeded. Reads
-/// stdout/stderr only after exit — safe here because the helper's own
-/// output is a handful of short lines at most, never enough to fill a pipe
-/// buffer and risk the classic write-blocks-because-nobody-is-reading
-/// deadlock a long-running/chatty child could hit with this pattern.
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<Output> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("could not poll the native-hid helper")?
-        {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                let _ = pipe.read_to_end(&mut stdout);
-            }
-            if let Some(mut pipe) = child.stderr.take() {
-                let _ = pipe.read_to_end(&mut stderr);
-            }
-            return Ok(Output {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "the native-hid helper did not finish within {}s",
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+fn read_capped(pipe: impl Read) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.take((HELPER_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > HELPER_OUTPUT_LIMIT {
+        bail!("native-hid helper exceeded the output limit");
     }
+    Ok(bytes)
+}
+
+fn wait_with_timeout(mut child: Child, payload: Vec<u8>, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    let outcome = (|| {
+        let stdin = child
+            .stdin
+            .take()
+            .context("native-hid helper stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("native-hid helper stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("native-hid helper stderr unavailable")?;
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        for (index, pipe) in [
+            (1, Box::new(stdout) as Box<dyn Read + Send>),
+            (2, Box::new(stderr) as Box<dyn Read + Send>),
+        ] {
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name(format!("openmouse-helper-output-{index}"))
+                .spawn(move || {
+                    let _ = tx.send((index, read_capped(pipe)));
+                })
+                .context("could not start native-hid output reader")?;
+        }
+        std::thread::Builder::new()
+            .name("openmouse-helper-input".into())
+            .spawn(move || {
+                let mut stdin = stdin;
+                let result = stdin
+                    .write_all(&payload)
+                    .map(|()| Vec::new())
+                    .map_err(anyhow::Error::from);
+                drop(stdin);
+                let _ = tx.send((0, result));
+            })
+            .context("could not start native-hid input writer")?;
+        let mut received: [Option<Vec<u8>>; 3] = [None, None, None];
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .context("could not poll the native-hid helper")?;
+            }
+            if let Some(status) = status
+                && received.iter().all(Option::is_some)
+            {
+                return Ok(Output {
+                    status,
+                    stdout: received[1].take().unwrap(),
+                    stderr: received[2].take().unwrap(),
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "the native-hid helper did not finish within {}s",
+                    timeout.as_secs()
+                );
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok((index, result)) => received[index] = Some(result?),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if received.iter().any(Option::is_none) {
+                        bail!("native-hid I/O worker stopped");
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
+        }
+    })();
+    if outcome.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_output_is_bounded_before_json_decoding() {
+        assert_eq!(
+            read_capped(std::io::Cursor::new(vec![1; HELPER_OUTPUT_LIMIT]))
+                .unwrap()
+                .len(),
+            HELPER_OUTPUT_LIMIT
+        );
+        assert!(read_capped(std::io::Cursor::new(vec![1; HELPER_OUTPUT_LIMIT + 1])).is_err());
+    }
 
     fn reply(percent: Option<f64>, state: Option<&str>) -> StatusReply {
         StatusReply {

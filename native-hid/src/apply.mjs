@@ -34,7 +34,9 @@ globalThis.window ??= globalThis;
 
 import { BRAND_DRIVERS, brandKey } from "./brands.mjs";
 import { applyX11PollingRate, x11DeviceInfos } from "./attack-shark-x11.mjs";
-import { candidateDevices } from "./hid-device-adapter.mjs";
+import { candidateDevices, probeVerifiedDevice } from "./hid-device-adapter.mjs";
+import { devices } from "node-hid";
+import { automate } from "./automation.mjs";
 
 const EXIT_APPLIED = 0;
 const EXIT_FAILED = 1;
@@ -82,6 +84,14 @@ async function main() {
   const brand = typeof input.brand === "string" ? input.brand : "";
   const normalizedBrand = brandKey(brand);
   const entry = BRAND_DRIVERS[normalizedBrand];
+  if (input.action === "automatic-read" || input.action === "automatic-apply") {
+    const reply = await automate(input, {
+      list: () => devices(),
+      probe: (info, identity) => probeVerifiedDevice(info, identity, (device) => probe(device, entry.classes[0])),
+    });
+    process.stdout.write(JSON.stringify(reply));
+    process.exit(EXIT_APPLIED);
+  }
   if (!entry) {
     console.error(`[native-hid] no driver registered for brand "${brand}"`);
     process.exit(EXIT_NO_DRIVER);

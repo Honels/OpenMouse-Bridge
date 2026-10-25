@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     applications::{self, ApplicationInfo},
-    config::{self, ApplicationProfile, BridgeConfig, GameConfig},
+    config::{self, ApplicationProfile, BridgeConfig, GameConfig, LocalApplication},
     games::GameDetector,
     platform,
 };
@@ -43,6 +43,7 @@ fn is_registered_game(application: &ApplicationInfo, games: &[GameConfig]) -> bo
 
 /// The running applications that are registered games. Profile matching only
 /// looks at these; the unfiltered list feeds the game-request picker.
+#[cfg(test)]
 fn registered_applications(
     running: &[ApplicationInfo],
     games: &[GameConfig],
@@ -50,6 +51,28 @@ fn registered_applications(
     running
         .iter()
         .filter(|application| is_registered_game(application, games))
+        .cloned()
+        .collect()
+}
+
+fn profile_applications(
+    running: &[ApplicationInfo],
+    games: &[GameConfig],
+    local_applications: &[LocalApplication],
+) -> Vec<ApplicationInfo> {
+    running
+        .iter()
+        .filter(|application| {
+            is_registered_game(application, games)
+                || local_applications.iter().any(|target| {
+                    crate::games::matches_target(
+                        &target.path,
+                        &target.executable,
+                        &application.path,
+                        &application.executable,
+                    )
+                })
+        })
         .cloned()
         .collect()
 }
@@ -109,41 +132,130 @@ fn profile_devices(config: &BridgeConfig) -> Vec<(String, String)> {
 /// one for a game that is still running, so alt-tabbing out of a game keeps
 /// its profile until the game closes, else the configured default profile.
 /// Shared by the snapshot and the monitor.
+#[cfg(test)]
 fn active_profile_for(
     config: &BridgeConfig,
     applications: &[ApplicationInfo],
     active_games: &[String],
 ) -> Option<ApplicationProfile> {
-    let enabled = || config.profiles.iter().filter(|profile| profile.enabled);
-    let foreground = applications
-        .iter()
-        .find(|application| application.foreground)
-        .and_then(|application| {
-            enabled().find(|profile| {
-                // Game profiles leave some of these empty; an empty field
-                // must not match an application that also reports none.
-                let matches = |saved: &str, running: &str| {
-                    !saved.is_empty() && saved.eq_ignore_ascii_case(running)
-                };
-                matches(&profile.application.path, &application.path)
-                    || matches(&profile.application.name, &application.name)
-                    || matches(&profile.application.executable, &application.executable)
-            })
+    resolve_profile(config, applications, active_games, &[])
+}
+
+#[cfg(test)]
+fn resolve_profile(
+    config: &BridgeConfig,
+    applications: &[ApplicationInfo],
+    active_games: &[String],
+    processes: &[crate::games::RunningProcess],
+) -> Option<ApplicationProfile> {
+    resolve_profile_retaining(config, applications, active_games, processes, None)
+}
+
+fn resolve_profile_retaining(
+    config: &BridgeConfig,
+    applications: &[ApplicationInfo],
+    active_games: &[String],
+    processes: &[crate::games::RunningProcess],
+    current: Option<&ApplicationProfile>,
+) -> Option<ApplicationProfile> {
+    let eligible = |profile: &&ApplicationProfile| {
+        if !profile.enabled {
+            return false;
+        }
+        if let Some(id) = &profile.application.local_id {
+            return config
+                .local_applications
+                .iter()
+                .find(|target| &target.id == id)
+                .is_some_and(|target| {
+                    if target.path.is_empty() {
+                        return false;
+                    }
+                    match target.effective_activation() {
+                        config::LocalApplicationActivation::Running => {
+                            processes.iter().any(|process| {
+                                crate::games::matches_target(
+                                    &target.path,
+                                    &target.executable,
+                                    &process.path,
+                                    &process.executable,
+                                )
+                            })
+                        }
+                        config::LocalApplicationActivation::Focused => {
+                            applications.iter().any(|application| {
+                                application.foreground
+                                    && crate::games::matches_target(
+                                        &target.path,
+                                        &target.executable,
+                                        &application.path,
+                                        &application.executable,
+                                    )
+                            })
+                        }
+                    }
+                });
+        }
+        let application = &profile.application;
+        let focused = applications.iter().any(|running| {
+            running.foreground
+                && if !application.path.is_empty() {
+                    crate::games::matches_target(
+                        &application.path,
+                        &application.executable,
+                        &running.path,
+                        &running.executable,
+                    )
+                } else if !application.executable.is_empty() {
+                    application
+                        .executable
+                        .eq_ignore_ascii_case(&running.executable)
+                } else {
+                    !application.name.is_empty()
+                        && application.name.eq_ignore_ascii_case(&running.name)
+                }
         });
-    let running_game = || {
-        active_games.iter().find_map(|name| {
-            let game = config.games.iter().find(|game| &game.name == name)?;
-            enabled().find(|profile| profile_matches_game(profile, game))
-        })
+        focused
+            || config.games.iter().any(|game| {
+                active_games.contains(&game.name)
+                    && if application.path.is_empty() {
+                        profile_matches_game(profile, game)
+                    } else {
+                        processes.iter().any(|process| {
+                            crate::games::matches_target(
+                                &application.path,
+                                &application.executable,
+                                &process.path,
+                                &process.executable,
+                            ) && game.executables.iter().any(|executable| {
+                                executable.eq_ignore_ascii_case(&process.executable)
+                            })
+                        })
+                    }
+            })
     };
-    foreground
-        .or_else(running_game)
+    let retained = current.and_then(|current| {
+        config.profiles.iter().filter(eligible).find(|profile| {
+            profile.application_key() == current.application_key()
+                && profile.device.id == current.device.id
+        })
+    });
+    retained
+        .or_else(|| config.profiles.iter().find(eligible))
         .cloned()
-        .or_else(|| config.default_profile.clone())
+        .or_else(|| {
+            config
+                .default_profile
+                .clone()
+                .filter(|profile| profile.enabled)
+        })
 }
 
 fn profile_matches_game(profile: &ApplicationProfile, game: &GameConfig) -> bool {
     let application = &profile.application;
+    if !application.path.is_empty() || application.local_id.is_some() {
+        return false;
+    }
     (!application.name.is_empty()
         && normalized_name(&application.name) == normalized_name(&game.name))
         || (!application.executable.is_empty()
@@ -155,11 +267,14 @@ fn profile_matches_game(profile: &ApplicationProfile, game: &GameConfig) -> bool
 
 /// A stable identity for a profile, used to detect switches.
 fn profile_key(profile: &ApplicationProfile) -> String {
-    if profile.application.path.is_empty() {
-        profile.application.name.to_ascii_lowercase()
+    let application = if let Some(id) = &profile.application.local_id {
+        id.clone()
+    } else if profile.application.path.is_empty() {
+        format!("preset:{}", profile.application.name.to_ascii_lowercase())
     } else {
-        profile.application.path.to_ascii_lowercase()
-    }
+        format!("path:{}", crate::games::path_key(&profile.application.path))
+    };
+    format!("{}:{}{}", application.len(), application, profile.device.id)
 }
 
 /// Something worth telling the user about, already worded: a title such as the
@@ -229,13 +344,19 @@ fn switch_message(
             detail: "Profile off".into(),
         },
     };
-    if current.is_some() && !panel_connected {
+    if !panel_connected {
         match outcome {
             Some(ApplyOutcome::Failed) => {
-                switch.detail = "Couldn't reach the mouse — open OpenMouse to apply".into();
+                switch.detail = if current.is_none() {
+                    "Couldn't restore original mouse settings — check Bridge status".into()
+                } else {
+                    "Couldn't reach the mouse — open OpenMouse to apply".into()
+                };
             }
             Some(ApplyOutcome::NoDriver) => {
-                switch.detail = "Open OpenMouse to apply this profile".into();
+                switch.detail =
+                    "Native automation unsupported — acknowledged device readback is required"
+                        .into();
             }
             _ => {}
         }
@@ -243,17 +364,21 @@ fn switch_message(
     Some(switch)
 }
 
+type PanelListener = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
     config_path: Arc<PathBuf>,
     notice_listener: Arc<std::sync::Mutex<Option<NoticeListener>>>,
-    show_panel: Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    show_panel: Arc<std::sync::Mutex<Option<PanelListener>>>,
+    native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
 }
 
 struct BridgeState {
     config: BridgeConfig,
     active_games: Vec<String>,
+    processes: Vec<crate::games::RunningProcess>,
     applications: Vec<ApplicationInfo>,
     // Every visible application, registered game or not — what a control
     // panel offers when someone requests a new game or app be added.
@@ -263,6 +388,8 @@ struct BridgeState {
     // Debounced active-profile tracking for switch notifications.
     active_profile_key: Option<String>,
     applied_profile: Option<ApplicationProfile>,
+    native_automation_error: Option<String>,
+    pending_native_restores: usize,
     pending_profile: Option<(Option<String>, Instant)>,
     profile_seeded: bool,
     started_at: Instant,
@@ -336,6 +463,8 @@ pub struct BridgeSnapshot {
     pub foreground_application: Option<ApplicationInfo>,
     pub active_profile: Option<ApplicationProfile>,
     pub active_profile_is_default: bool,
+    pub native_automation_error: Option<String>,
+    pub pending_native_restores: usize,
     pub visible_application_count: usize,
     pub profile_count: usize,
     pub client_connected: bool,
@@ -349,12 +478,15 @@ impl BridgeService {
             inner: Arc::new(RwLock::new(BridgeState {
                 config,
                 active_games: Vec::new(),
+                processes: Vec::new(),
                 applications: Vec::new(),
                 running_applications: Vec::new(),
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
                 active_profile_key: None,
                 applied_profile: None,
+                native_automation_error: None,
+                pending_native_restores: 0,
                 pending_profile: None,
                 profile_seeded: false,
                 started_at: Instant::now(),
@@ -363,6 +495,7 @@ impl BridgeService {
             config_path: Arc::new(config_path),
             notice_listener: Arc::default(),
             show_panel: Arc::default(),
+            native_automation: Arc::default(),
         }
     }
 
@@ -387,15 +520,14 @@ impl BridgeService {
     }
 
     pub async fn acknowledge_tray_hint(&self) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            if state.config.tray_hint_shown {
-                return Ok(());
-            }
-            state.config.tray_hint_shown = true;
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        if self.inner.read().await.config.tray_hint_shown {
+            return Ok(());
+        }
+        self.update_config(|config| {
+            config.tray_hint_shown = true;
+            Ok(())
+        })
+        .await
     }
 
     /// Sends profile switches and low-battery alerts to `listener` instead of
@@ -440,8 +572,13 @@ impl BridgeService {
             .iter()
             .find(|application| application.foreground)
             .cloned();
-        let active_profile =
-            active_profile_for(&state.config, &state.applications, &state.active_games);
+        let active_profile = resolve_profile_retaining(
+            &state.config,
+            &state.applications,
+            &state.active_games,
+            &state.processes,
+            state.applied_profile.as_ref(),
+        );
         let active_profile_is_default =
             active_profile.is_some() && active_profile == state.config.default_profile;
         let mut batteries = state
@@ -471,7 +608,26 @@ impl BridgeService {
             platform: platform::platform_name(),
             linux_distribution: platform::linux_distribution(),
             uptime_seconds: state.started_at.elapsed().as_secs(),
-            active_games: state.active_games.clone(),
+            active_games: state
+                .active_games
+                .iter()
+                .filter_map(|active| {
+                    state
+                        .config
+                        .local_applications
+                        .iter()
+                        .find(|target| &target.id == active)
+                        .map(|target| target.name.clone())
+                        .or_else(|| {
+                            state
+                                .config
+                                .games
+                                .iter()
+                                .find(|game| &game.name == active)
+                                .map(|game| game.name.clone())
+                        })
+                })
+                .collect(),
             games: state
                 .config
                 .games
@@ -480,8 +636,25 @@ impl BridgeService {
                     name: game.name.clone(),
                     active: state.active_games.iter().any(|active| active == &game.name),
                 })
+                .chain(
+                    state
+                        .config
+                        .local_applications
+                        .iter()
+                        .filter(|target| target.kind == config::LocalApplicationKind::Game)
+                        .map(|target| GameActivity {
+                            name: target.name.clone(),
+                            active: state.active_games.contains(&target.id),
+                        }),
+                )
                 .collect(),
-            tracked_game_count: state.config.games.len(),
+            tracked_game_count: state.config.games.len()
+                + state
+                    .config
+                    .local_applications
+                    .iter()
+                    .filter(|target| target.kind == config::LocalApplicationKind::Game)
+                    .count(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
             automatic_updates: state.config.automatic_updates,
@@ -490,6 +663,8 @@ impl BridgeService {
             foreground_application,
             active_profile,
             active_profile_is_default,
+            native_automation_error: state.native_automation_error.clone(),
+            pending_native_restores: state.pending_native_restores,
             visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
             client_connected,
@@ -528,28 +703,93 @@ impl BridgeService {
         self.inner.read().await.config.profiles.clone()
     }
 
-    pub async fn games(&self) -> Vec<GameConfig> {
-        self.inner.read().await.config.games.clone()
+    pub async fn games(&self) -> Vec<serde_json::Value> {
+        let state = self.inner.read().await;
+        state.config.games.iter().map(|game| serde_json::json!({"name":game.name,"executables":game.executables,"source":"preset"}))
+            .chain(state.config.local_applications.iter().map(|target| {
+                let mut entry = serde_json::json!({"id":target.id,"name":target.name,"executables":[target.executable],"source":"local","path":target.path,"kind":target.kind});
+                if let Some(activation) = target.activation { entry["activation"] = serde_json::json!(activation); }
+                if let Some(path) = &target.bundle_path { entry["bundlePath"] = path.clone().into(); }
+                if let Some(identifier) = &target.bundle_identifier { entry["bundleIdentifier"] = identifier.clone().into(); }
+                entry
+            })).collect()
     }
 
-    pub async fn replace_profiles(&self, profiles: Vec<ApplicationProfile>) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.profiles = profiles;
-            state.config = state.config.clone().normalized();
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+    pub async fn local_applications(&self) -> Vec<config::LocalApplication> {
+        self.inner.read().await.config.local_applications.clone()
     }
 
-    pub async fn set_default_profile(&self, profile: ApplicationProfile) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.default_profile = Some(profile);
-            state.config = state.config.clone().normalized();
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+    async fn update_config(
+        &self,
+        update: impl FnOnce(&mut BridgeConfig) -> Result<()>,
+    ) -> Result<()> {
+        let mut state = self.inner.write().await;
+        let mut next = state.config.clone();
+        update(&mut next)?;
+        next = next.normalized();
+        for profile in next
+            .profiles
+            .iter_mut()
+            .chain(next.default_profile.iter_mut())
+        {
+            crate::local_targets::canonicalize_profile(profile, &next.local_applications)?;
+        }
+        config::save(&self.config_path, &next)?;
+        state.config = next;
+        Ok(())
+    }
+
+    pub async fn replace_local_applications(
+        &self,
+        applications: Vec<config::LocalApplication>,
+    ) -> Result<Vec<config::LocalApplication>> {
+        let mut canonical = Vec::new();
+        self.update_config(|config| {
+            let applications = crate::local_targets::canonicalize_against(
+                &applications,
+                &config.local_applications,
+            )?;
+            canonical = applications.clone();
+            config.profiles.retain(|profile| {
+                profile
+                    .application
+                    .local_id
+                    .as_ref()
+                    .is_none_or(|id| applications.iter().any(|target| &target.id == id))
+            });
+            if config
+                .default_profile
+                .as_ref()
+                .and_then(|profile| profile.application.local_id.as_ref())
+                .is_some_and(|id| !applications.iter().any(|target| &target.id == id))
+            {
+                config.default_profile = None;
+            }
+            config.local_applications = applications;
+            Ok(())
+        })
+        .await?;
+        Ok(canonical)
+    }
+
+    pub async fn replace_profiles(&self, mut profiles: Vec<ApplicationProfile>) -> Result<()> {
+        self.update_config(move |config| {
+            for profile in &mut profiles {
+                crate::local_targets::canonicalize_profile(profile, &config.local_applications)?;
+            }
+            config.profiles = profiles;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_default_profile(&self, mut profile: ApplicationProfile) -> Result<()> {
+        self.update_config(move |config| {
+            crate::local_targets::canonicalize_profile(&mut profile, &config.local_applications)?;
+            config.default_profile = Some(profile);
+            Ok(())
+        })
+        .await
     }
 
     /// Turns launch-at-login on the first time a release build runs; after
@@ -559,50 +799,43 @@ impl BridgeService {
             return Ok(());
         }
         platform::set_autostart(true)?;
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.autostart_configured = true;
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.update_config(|config| {
+            config.autostart_configured = true;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn set_battery_threshold(&self, percent: u8) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.battery_threshold_percent = percent;
-            state.config = state.config.clone().normalized();
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.update_config(|config| {
+            config.battery_threshold_percent = percent;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn set_automatic_updates(&self, enabled: bool) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.automatic_updates = enabled;
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.update_config(|config| {
+            config.automatic_updates = enabled;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn set_notification_sound(&self, enabled: bool) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.notification_sound = enabled;
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.update_config(|config| {
+            config.notification_sound = enabled;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn set_notification_volume(&self, percent: u8) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.notification_volume = percent;
-            state.config = state.config.clone().normalized();
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.update_config(|config| {
+            config.notification_volume = percent;
+            Ok(())
+        })
+        .await
     }
 
     /// Forgets a lingering battery entry so a dead device leaves the list.
@@ -704,17 +937,83 @@ impl BridgeService {
         });
     }
 
+    async fn reconcile_native_with(
+        &self,
+        operation: impl FnOnce(Option<ApplicationProfile>) -> (Option<String>, usize) + Send + 'static,
+    ) -> Option<ApplyOutcome> {
+        let mut state = self.inner.clone().write_owned().await;
+        let selected = resolve_profile_retaining(
+            &state.config,
+            &state.applications,
+            &state.active_games,
+            &state.processes,
+            state.applied_profile.as_ref(),
+        );
+        if selected.is_some() && selected != state.applied_profile {
+            return None;
+        }
+        let desired = selected;
+        let result = tokio::task::spawn_blocking(move || {
+            let has_profile = desired.is_some();
+            let (error, pending) = operation(desired);
+            let outcome = match &error {
+                Some(message) if message.contains("unsupported") => Some(ApplyOutcome::NoDriver),
+                Some(_) => Some(ApplyOutcome::Failed),
+                None if has_profile => Some(ApplyOutcome::Applied),
+                None => None,
+            };
+            state.native_automation_error = error;
+            state.pending_native_restores = pending;
+            outcome
+        })
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(%error, "Native automation worker failed without publishing a stale completion");
+                Some(ApplyOutcome::Failed)
+            }
+        }
+    }
+
+    async fn reconcile_native(&self) -> Option<ApplyOutcome> {
+        let automation = self.native_automation.clone();
+        self.reconcile_native_with(move |desired| {
+            let mut automation = automation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = crate::drivers::reconcile_automatic(&mut automation, desired.as_ref());
+            (
+                result.err().map(|error| format!("{error:#}")),
+                automation.pending_restores_for(desired.as_ref()),
+            )
+        })
+        .await
+    }
+
     pub fn start_game_monitor(&self, extract_icons: Arc<AtomicBool>) {
         let service = self.clone();
         tokio::spawn(async move {
             let mut detector = GameDetector::default();
             let mut interval = tokio::time::interval(Duration::from_secs(3));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                let games = service.inner.read().await.config.games.clone();
-                let active = detector.detect(&games);
+                let (games, local_applications) = {
+                    let state = service.inner.read().await;
+                    (
+                        state.config.games.clone(),
+                        state.config.local_applications.clone(),
+                    )
+                };
+                let mut active = detector.detect(&games);
+                let processes = detector.running_processes();
+                active.extend(crate::games::matches_local_games(
+                    &local_applications,
+                    &processes,
+                ));
                 let running = applications::visible_applications();
-                let applications = registered_applications(&running, &games);
+                let applications = profile_applications(&running, &games, &local_applications);
                 // Icon extraction can be disabled by callers that never serve
                 // the application's icon endpoint.
                 let icons = if extract_icons.load(Ordering::Acquire) {
@@ -739,6 +1038,7 @@ impl BridgeService {
                 };
                 let mut state = service.inner.write().await;
                 state.active_games = active;
+                state.processes = processes;
                 state.applications = applications;
                 state.application_icons.extend(icons);
                 prune_application_icons(&mut state.application_icons, &running);
@@ -748,8 +1048,13 @@ impl BridgeService {
                 // profile's DPI/polling rate to the mouse over native HID
                 // when Bridge has a driver for it, and announce the switch
                 // once the new profile has stayed active long enough.
-                let current =
-                    active_profile_for(&state.config, &state.applications, &state.active_games);
+                let current = resolve_profile_retaining(
+                    &state.config,
+                    &state.applications,
+                    &state.active_games,
+                    &state.processes,
+                    state.applied_profile.as_ref(),
+                );
                 let current_key = current.as_ref().map(profile_key);
                 // (new profile, the one it replaces, whether to announce it)
                 let mut switch: Option<(
@@ -766,7 +1071,9 @@ impl BridgeService {
                     state.pending_profile = None;
                     state.profile_seeded = true;
                     switch = Some((current, None, false));
-                } else if current_key == state.active_profile_key {
+                } else if current_key == state.active_profile_key
+                    && current == state.applied_profile
+                {
                     state.pending_profile = None;
                 } else {
                     let ready = matches!(
@@ -787,65 +1094,21 @@ impl BridgeService {
                 }
                 let default = state.config.default_profile.clone();
                 drop(state);
-                if let Some((current, previous, announce)) = switch {
-                    let service = service.clone();
-                    std::thread::spawn(move || {
-                        // A connected control panel applies the profile over its
-                        // own HID session; writing natively as well would
-                        // interleave two writers on the same mouse.
-                        let panel_connected = crate::hid::client_session_active();
-                        let outcome = if panel_connected {
-                            None
-                        } else {
-                            current.as_ref().map(apply_natively)
-                        };
-                        if !announce {
-                            return;
-                        }
-                        let Some(message) = switch_message(
-                            previous.as_ref(),
-                            current.as_ref(),
-                            default.as_ref(),
-                            outcome,
-                            panel_connected,
-                        ) else {
-                            return;
-                        };
-                        service.announce(message);
-                    });
+                let panel_connected = crate::hid::client_session_active();
+                let outcome = service.reconcile_native().await;
+                if let Some((current, previous, true)) = switch
+                    && let Some(message) = switch_message(
+                        previous.as_ref(),
+                        current.as_ref(),
+                        default.as_ref(),
+                        outcome,
+                        panel_connected,
+                    )
+                {
+                    service.announce(message);
                 }
             }
         });
-    }
-}
-
-fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
-    match crate::drivers::apply_profile(profile) {
-        Ok(true) => {
-            tracing::info!(
-                profile = %profile.application.name,
-                device = %profile.device.name,
-                "Applied the mouse profile natively"
-            );
-            ApplyOutcome::Applied
-        }
-        Ok(false) => {
-            tracing::debug!(
-                profile = %profile.application.name,
-                device = %profile.device.name,
-                "No native driver for this device; not applying natively"
-            );
-            ApplyOutcome::NoDriver
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                profile = %profile.application.name,
-                device = %profile.device.name,
-                "Could not apply the mouse profile natively"
-            );
-            ApplyOutcome::Failed
-        }
     }
 }
 
@@ -868,6 +1131,10 @@ mod tests {
                 name: name.into(),
                 executable: format!("{name}.exe"),
                 path: path.into(),
+                local_id: None,
+                activation: None,
+                bundle_path: None,
+                bundle_identifier: None,
             },
             device: config::ProfileDevice {
                 id: "device".into(),
@@ -890,6 +1157,406 @@ mod tests {
             foreground,
             icon_id: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_native_join_does_not_publish_unowned_stale_completion() {
+        let bridge = service(BridgeConfig::default());
+        bridge.inner.write().await.native_automation_error = Some("owned status".into());
+        assert_eq!(
+            bridge
+                .reconcile_native_with(|_| panic!("inert worker failure"))
+                .await,
+            Some(ApplyOutcome::Failed)
+        );
+        assert_eq!(
+            bridge.inner.read().await.native_automation_error.as_deref(),
+            Some("owned status")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_worker_retains_serialization_after_waiter_cancellation() {
+        let bridge = service(BridgeConfig::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let running = bridge.clone();
+        let waiter = tokio::spawn(async move {
+            running
+                .reconcile_native_with(move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    (Some("retained completion".into()), 1)
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(bridge.inner.try_write().is_err());
+        release_tx.send(()).unwrap();
+        let state = tokio::time::timeout(Duration::from_secs(5), bridge.inner.write())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.native_automation_error.as_deref(),
+            Some("retained completion")
+        );
+        assert_eq!(state.pending_native_restores, 1);
+    }
+
+    #[tokio::test]
+    async fn native_pending_handoff_keeps_original_baseline_without_old_writes() {
+        let old = test_profile("Old", "/old", Some(1600), None);
+        let next = test_profile("Next", "/next", Some(3200), None);
+        let bridge = service(BridgeConfig {
+            profiles: vec![old.clone(), next],
+            ..BridgeConfig::default()
+        });
+        {
+            let mut state = bridge.inner.write().await;
+            state.applied_profile = Some(old);
+            state.applications = vec![test_app("Next", "/next", true)];
+        }
+        assert_eq!(bridge.reconcile_native_with(|_| panic!("pending handoff must retain journal without applying/restoring until arbitration settles")).await, None);
+    }
+
+    #[tokio::test]
+    async fn native_selection_rechecks_disabled_profile_before_hardware() {
+        let game = test_profile("Game", "/game", Some(1600), None);
+        let bridge = service(BridgeConfig {
+            profiles: vec![game.clone()],
+            ..BridgeConfig::default()
+        });
+        {
+            let mut state = bridge.inner.write().await;
+            state.applied_profile = Some(game);
+            state.applications = vec![test_app("Game", "/game", true)];
+            state.config.profiles[0].enabled = false;
+        }
+        bridge
+            .reconcile_native_with(|desired| {
+                assert!(
+                    desired.is_none(),
+                    "disabled profile must never reach the native writer"
+                );
+                (None, 0)
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn native_reconcile_serializes_configuration_and_reports_truthful_failure() {
+        let game = test_profile("Game", "/game", Some(1600), None);
+        let bridge = service(BridgeConfig {
+            profiles: vec![game.clone()],
+            ..BridgeConfig::default()
+        });
+        {
+            let mut state = bridge.inner.write().await;
+            state.applied_profile = Some(game.clone());
+            state.applications = vec![test_app("Game", "/game", true)];
+        }
+        let checked = bridge.clone();
+        bridge
+            .reconcile_native_with(move |desired| {
+                assert_eq!(desired, Some(game));
+                assert!(
+                    checked.inner.try_write().is_err(),
+                    "configuration must not change during the bounded HID operation"
+                );
+                (Some("unsupported acknowledged readback".into()), 1)
+            })
+            .await;
+        let snapshot = bridge.snapshot().await;
+        assert_eq!(
+            snapshot.native_automation_error.as_deref(),
+            Some("unsupported acknowledged readback")
+        );
+        assert_eq!(snapshot.pending_native_restores, 1);
+        assert!(snapshot.active_profile.is_some());
+    }
+
+    #[tokio::test]
+    async fn running_arbitration_retains_current_then_uses_persisted_order() {
+        let mut first = test_profile("Zed", "/opt/zed", Some(800), None);
+        first.application.local_id = Some("local:zed".into());
+        let mut second = test_profile("Alpha", "/opt/alpha", Some(1600), None);
+        second.application.local_id = Some("local:alpha".into());
+        let config = BridgeConfig {
+            local_applications: serde_json::from_value(serde_json::json!([
+                {"id":"local:zed","name":"Zed","executable":"zed","path":"/opt/zed","kind":"app","activation":"running"},
+                {"id":"local:alpha","name":"Alpha","executable":"alpha","path":"/opt/alpha","kind":"app","activation":"running"}
+            ])).unwrap(),
+            profiles: vec![first.clone(), second.clone()],
+            ..BridgeConfig::default()
+        }.normalized();
+        let first = config.profiles[0].clone();
+        let second = config.profiles[1].clone();
+        let bridge = service(config);
+        {
+            let mut state = bridge.inner.write().await;
+            state.active_games = vec!["local:alpha".into(), "local:zed".into()];
+            state.processes = vec![
+                crate::games::RunningProcess {
+                    executable: "zed".into(),
+                    path: "/opt/zed".into(),
+                },
+                crate::games::RunningProcess {
+                    executable: "alpha".into(),
+                    path: "/opt/alpha".into(),
+                },
+            ];
+        }
+        assert_eq!(bridge.snapshot().await.active_profile, Some(first.clone()));
+        bridge.inner.write().await.applied_profile = Some(second.clone());
+        assert_eq!(bridge.snapshot().await.active_profile, Some(second));
+        bridge.inner.write().await.config.profiles[1].enabled = false;
+        assert_eq!(bridge.snapshot().await.active_profile, Some(first));
+        bridge.inner.write().await.active_games.clear();
+        bridge.inner.write().await.processes.clear();
+        assert_eq!(bridge.snapshot().await.active_profile, None);
+    }
+
+    #[test]
+    fn local_running_ids_cannot_override_changed_executable_identity() {
+        let target: config::LocalApplication = serde_json::from_value(serde_json::json!({
+            "id":"local:editor","name":"Editor","executable":"editor","path":"/new/editor","kind":"app","activation":"running"
+        })).unwrap();
+        let mut profile = test_profile("Editor", "/new/editor", Some(800), None);
+        profile.application.local_id = Some(target.id.clone());
+        let config = BridgeConfig {
+            local_applications: vec![target],
+            profiles: vec![profile],
+            ..BridgeConfig::default()
+        };
+        assert_eq!(
+            resolve_profile(
+                &config,
+                &[],
+                &["local:editor".into()],
+                &[crate::games::RunningProcess {
+                    executable: "editor".into(),
+                    path: "/old/editor".into()
+                }]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn full_path_never_falls_back_to_name_or_executable() {
+        let profile = test_profile("Editor", "C:/Trusted/Editor.exe", Some(800), None);
+        let config = BridgeConfig {
+            profiles: vec![profile.clone()],
+            ..BridgeConfig::default()
+        };
+        assert_eq!(
+            active_profile_for(
+                &config,
+                &[test_app("Editor", "C:/Other/Editor.exe", true)],
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            active_profile_for(
+                &config,
+                &[test_app("Editor", r"c:\trusted\EDITOR.exe", true)],
+                &[]
+            ),
+            Some(profile)
+        );
+        let profile = test_profile("Editor", "/Apps/Editor", Some(800), None);
+        let config = BridgeConfig {
+            profiles: vec![profile],
+            ..BridgeConfig::default()
+        };
+        assert_eq!(
+            active_profile_for(&config, &[test_app("Editor", "/apps/editor", true)], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn local_game_background_activity_is_id_linked_and_not_catalog_gated() {
+        let mut profile = test_profile("Editor", "/opt/Editor.exe", Some(1200), None);
+        profile.application.local_id = Some("local:editor".into());
+        let config = BridgeConfig {
+            local_applications: vec![serde_json::from_value(serde_json::json!({"id":"local:editor","name":"Editor","executable":"Editor.exe","path":"/opt/Editor.exe","kind":"game"})).unwrap()],
+            profiles: vec![profile.clone()],
+            default_profile: Some(test_profile("Default", "", Some(800), None)),
+            ..BridgeConfig::default()
+        };
+        assert_eq!(
+            resolve_profile(
+                &config,
+                &[],
+                &["local:editor".into()],
+                &[crate::games::RunningProcess {
+                    executable: "Editor.exe".into(),
+                    path: "/opt/Editor.exe".into()
+                }]
+            ),
+            Some(profile)
+        );
+    }
+
+    #[test]
+    fn local_foreground_apps_bypass_catalog_but_do_not_stay_active_in_background() {
+        let mut profile = test_profile("Editor", "C:/Tools/Editor.exe", Some(1200), None);
+        profile.application.local_id = Some("local:editor".into());
+        let target = serde_json::from_value(serde_json::json!({"id":"local:editor","name":"Editor","executable":"Editor.exe","path":"C:/Tools/Editor.exe","kind":"app"})).unwrap();
+        let config = BridgeConfig {
+            local_applications: vec![target],
+            profiles: vec![profile.clone()],
+            ..BridgeConfig::default()
+        };
+        let application = test_app("Editor", "C:/Tools/Editor.exe", true);
+        let selected = profile_applications(
+            std::slice::from_ref(&application),
+            &config.games,
+            &config.local_applications,
+        );
+        assert_eq!(selected, [application]);
+        assert_eq!(active_profile_for(&config, &selected, &[]), Some(profile));
+        let background = test_app("Editor", "C:/Tools/Editor.exe", false);
+        assert_eq!(
+            active_profile_for(&config, &[background], &["local:editor".into()]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn local_activity_status_uses_display_names_not_internal_ids() {
+        let target = serde_json::from_value(serde_json::json!({"id":"local:game","name":"Custom Game","executable":"custom.exe","path":"","kind":"game"})).unwrap();
+        let bridge = service(BridgeConfig {
+            local_applications: vec![target],
+            ..BridgeConfig::default()
+        });
+        bridge.inner.write().await.active_games = vec!["local:game".into()];
+        let status = bridge.snapshot().await;
+        assert_eq!(status.active_games, ["Custom Game"]);
+        assert_eq!(status.tracked_game_count, 1);
+        assert!(
+            status
+                .games
+                .iter()
+                .any(|game| game.name == "Custom Game" && game.active)
+        );
+    }
+
+    #[test]
+    fn local_display_name_does_not_activate_an_unrelated_preset() {
+        let local: config::LocalApplication = serde_json::from_value(serde_json::json!({"id":"local:editor","name":"Editor","executable":"custom.exe","path":"","kind":"app"})).unwrap();
+        let preset = test_profile("Editor", "", Some(800), None);
+        let config = BridgeConfig {
+            games: vec![GameConfig {
+                name: "Editor".into(),
+                executables: vec!["Editor.exe".into()],
+            }],
+            local_applications: vec![local],
+            profiles: vec![preset],
+            ..BridgeConfig::default()
+        };
+        let mut application = test_app("Editor", "C:/Tools/custom.exe", true);
+        application.executable = "custom.exe".into();
+        let candidates =
+            profile_applications(&[application], &config.games, &config.local_applications);
+        assert_eq!(active_profile_for(&config, &candidates, &[]), None);
+    }
+
+    #[test]
+    fn explicit_local_paths_win_and_disabled_locals_return_to_default() {
+        let broad: config::LocalApplication = serde_json::from_value(serde_json::json!({"id":"local:broad","name":"Same","executable":"Editor.exe","path":"","kind":"game"})).unwrap();
+        let exact = config::LocalApplication {
+            id: "local:exact".into(),
+            path: "C:/Tools/Editor.exe".into(),
+            ..broad.clone()
+        };
+        let mut broad_profile = test_profile("Same", "", Some(800), None);
+        broad_profile.application.local_id = Some(broad.id.clone());
+        let mut exact_profile = test_profile("Same", &exact.path, Some(1600), None);
+        exact_profile.application.local_id = Some(exact.id.clone());
+        let default = test_profile("Default", "", Some(400), None);
+        let mut config = BridgeConfig {
+            local_applications: vec![broad, exact],
+            profiles: vec![exact_profile.clone(), broad_profile],
+            default_profile: Some(default.clone()),
+            ..BridgeConfig::default()
+        };
+        let foreground = test_app("Editor", "C:/Tools/Editor.exe", true);
+        assert_eq!(
+            resolve_profile(
+                &config,
+                std::slice::from_ref(&foreground),
+                &[],
+                &[crate::games::RunningProcess {
+                    executable: foreground.executable.clone(),
+                    path: foreground.path.clone()
+                }]
+            ),
+            Some(exact_profile.clone())
+        );
+        let processes = vec![crate::games::RunningProcess {
+            path: foreground.path.clone(),
+            executable: foreground.executable.clone(),
+        }];
+        let active = crate::games::matches_local_games(&config.local_applications, &processes);
+        assert_eq!(
+            resolve_profile(&config, &[], &active, &processes),
+            Some(exact_profile)
+        );
+        for profile in &mut config.profiles {
+            profile.enabled = false;
+        }
+        assert_eq!(
+            resolve_profile(&config, &[foreground], &active, &processes),
+            Some(default)
+        );
+    }
+
+    #[test]
+    fn background_preset_matching_never_ignores_a_saved_full_path() {
+        let profile = test_profile("Editor", "C:/Trusted/Editor.exe", Some(800), None);
+        let config = BridgeConfig {
+            games: vec![GameConfig {
+                name: "Editor".into(),
+                executables: vec!["Editor.exe".into()],
+            }],
+            profiles: vec![profile.clone()],
+            ..BridgeConfig::default()
+        };
+        let wrong = crate::games::RunningProcess {
+            executable: "Editor.exe".into(),
+            path: "C:/Other/Editor.exe".into(),
+        };
+        assert_eq!(
+            resolve_profile(&config, &[], &["Editor".into()], &[wrong]),
+            None
+        );
+        let matching = crate::games::RunningProcess {
+            executable: "Editor.exe".into(),
+            path: r"c:\trusted\EDITOR.exe".into(),
+        };
+        assert_eq!(
+            resolve_profile(&config, &[], &["Editor".into()], &[matching]),
+            Some(profile)
+        );
+    }
+
+    #[test]
+    fn local_and_preset_same_name_have_distinct_switch_keys() {
+        let preset = test_profile("Editor", "", Some(800), None);
+        let mut local = preset.clone();
+        local.application.local_id = Some("local:editor".into());
+        assert_ne!(profile_key(&preset), profile_key(&local));
+        let mut other_device = local.clone();
+        other_device.device.id = "other-device".into();
+        assert_ne!(profile_key(&local), profile_key(&other_device));
+        let mut other = local.clone();
+        other.application.local_id = Some("local:other".into());
+        assert_ne!(profile_key(&local), profile_key(&other));
     }
 
     #[test]
@@ -996,6 +1663,23 @@ mod tests {
                 .application
                 .name,
             "Default"
+        );
+    }
+
+    #[test]
+    fn failed_native_restore_is_not_announced_as_profile_off() {
+        let game = test_profile("Game", "/game", Some(1600), None);
+        let notice =
+            switch_message(Some(&game), None, None, Some(ApplyOutcome::Failed), false).unwrap();
+        assert_eq!(
+            notice.detail,
+            "Couldn't restore original mouse settings — check Bridge status"
+        );
+        let unsupported =
+            switch_message(None, Some(&game), None, Some(ApplyOutcome::NoDriver), false).unwrap();
+        assert_eq!(
+            unsupported.detail,
+            "Native automation unsupported — acknowledged device readback is required"
         );
     }
 
