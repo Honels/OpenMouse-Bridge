@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,8 @@ struct Entry {
     dpi: bool,
     polling: bool,
     failed: bool,
-    restore_attempts: u8,
+    restore_after: Option<Instant>,
+    restore_delay: Duration,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -119,6 +121,15 @@ impl NativeAutomation {
         desired: Option<&ApplicationProfile>,
         io: &mut impl AutomationIo,
     ) -> Result<()> {
+        self.reconcile_at(desired, io, Instant::now())
+    }
+
+    fn reconcile_at(
+        &mut self,
+        desired: Option<&ApplicationProfile>,
+        io: &mut impl AutomationIo,
+        now: Instant,
+    ) -> Result<()> {
         let mut errors = Vec::new();
         let mut removed: Vec<_> = self
             .entries
@@ -132,11 +143,12 @@ impl NativeAutomation {
         for id in removed {
             let entry = self.entries.get_mut(&id).unwrap();
             entry.failed = true;
-            if entry.restore_attempts >= 3 {
-                errors.push(format!("{id}: native restoration pending; three attempts exhausted, original baseline retained"));
+            if entry.restore_after.is_some_and(|deadline| now < deadline) {
+                errors.push(format!(
+                    "{id}: native restoration pending; retry delayed, original baseline retained"
+                ));
                 continue;
             }
-            entry.restore_attempts += 1;
             let settings = ProfileSettings {
                 dpi: entry.dpi.then_some(entry.baseline.dpi),
                 polling_rate_hz: entry.polling.then_some(entry.baseline.polling_rate_hz),
@@ -146,7 +158,14 @@ impl NativeAutomation {
                 Ok(()) => {
                     self.entries.remove(&id);
                 }
-                Err(error) => errors.push(format!("{id}: native restoration pending: {error:#}")),
+                Err(error) => {
+                    entry.restore_after = Some(now + entry.restore_delay);
+                    entry.restore_delay = entry
+                        .restore_delay
+                        .saturating_mul(2)
+                        .min(Duration::from_secs(60));
+                    errors.push(format!("{id}: native restoration pending: {error:#}"));
+                }
             }
         }
         if desired != self.attempted.as_ref() {
@@ -232,7 +251,8 @@ impl NativeAutomation {
                     dpi: false,
                     polling: false,
                     failed: false,
-                    restore_attempts: 0,
+                    restore_after: None,
+                    restore_delay: Duration::from_secs(1),
                 },
             );
         }
@@ -308,248 +328,4 @@ fn supported_brand(device_id: &str) -> Result<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Default)]
-    struct FakeIo {
-        calls: Vec<String>,
-        fail_reads: bool,
-        fail_writes: usize,
-        invalid_baseline: bool,
-    }
-
-    impl AutomationIo for FakeIo {
-        fn read(&mut self, id: &str) -> Result<Baseline> {
-            self.calls.push(format!("read:{id}"));
-            if self.fail_reads {
-                anyhow::bail!("unsupported readback");
-            }
-            Ok(Baseline {
-                identity: DeviceIdentity {
-                    vendor_id: 1,
-                    product_id: 2,
-                    path: id.into(),
-                    serial_number: "serial".into(),
-                    interface: Some(0),
-                },
-                dpi: if self.invalid_baseline { 0 } else { 800 },
-                polling_rate_hz: 1000,
-            })
-        }
-        fn write(
-            &mut self,
-            id: &str,
-            baseline: &Baseline,
-            settings: &ProfileSettings,
-        ) -> Result<()> {
-            assert_eq!(baseline.identity.path, id);
-            self.calls.push(format!(
-                "write:{id}:{:?}:{:?}",
-                settings.dpi, settings.polling_rate_hz
-            ));
-            if self.fail_writes > 0 {
-                self.fail_writes -= 1;
-                anyhow::bail!("write failed after possible partial hardware change");
-            }
-            Ok(())
-        }
-    }
-
-    fn profile(id: &str, dpi: Option<u32>, hz: Option<u32>) -> ApplicationProfile {
-        serde_json::from_value(serde_json::json!({"application":{"name":"Game","path":"/game","executable":"game"},"device":{"id":id,"name":"Mouse"},"settings":{"dpi":dpi,"pollingRateHz":hz},"enabled":true})).unwrap()
-    }
-
-    #[test]
-    fn unchanged_request_does_not_rewrite_and_empty_profile_does_not_read() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo::default();
-        let game = profile("a", Some(1600), None);
-        automation
-            .reconcile(Some(&profile("a", None, None)), &mut io)
-            .unwrap();
-        assert!(io.calls.is_empty());
-        automation.reconcile(Some(&game), &mut io).unwrap();
-        automation.reconcile(Some(&game), &mut io).unwrap();
-        assert_eq!(io.calls, ["read:a", "write:a:Some(1600):None"]);
-    }
-
-    #[test]
-    fn invalid_or_unreadable_baseline_never_writes() {
-        for invalid in [false, true] {
-            let mut automation = NativeAutomation::default();
-            let mut io = FakeIo {
-                fail_reads: !invalid,
-                invalid_baseline: invalid,
-                ..FakeIo::default()
-            };
-            assert!(
-                automation
-                    .reconcile(Some(&profile("a", Some(1600), None)), &mut io)
-                    .is_err()
-            );
-            assert_eq!(io.calls, ["read:a"]);
-            assert!(automation.entries.is_empty());
-        }
-    }
-
-    #[test]
-    fn failed_partial_apply_is_restored_even_if_same_request_remains() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo {
-            fail_writes: 1,
-            ..FakeIo::default()
-        };
-        let game = profile("a", Some(1600), Some(2000));
-        assert!(automation.reconcile(Some(&game), &mut io).is_err());
-        let _ = automation.reconcile(Some(&game), &mut io);
-        let _ = automation.reconcile(Some(&game), &mut io);
-        assert_eq!(
-            io.calls,
-            [
-                "read:a",
-                "write:a:Some(1600):Some(2000)",
-                "write:a:Some(800):Some(1000)"
-            ]
-        );
-        assert!(automation.entries.is_empty());
-    }
-
-    #[test]
-    fn owned_baseline_is_pending_when_final_target_ends_before_hid_access() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo::default();
-        let game = profile("a", Some(1600), None);
-        automation.reconcile(Some(&game), &mut io).unwrap();
-        assert_eq!(automation.pending_restores_for(Some(&game)), 0);
-        assert_eq!(automation.pending_restores_for(None), 1);
-        assert_eq!(io.calls.len(), 2);
-    }
-
-    #[test]
-    fn failed_restoration_retains_baseline_and_caps_attempts() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo::default();
-        automation
-            .reconcile(Some(&profile("a", Some(1600), None)), &mut io)
-            .unwrap();
-        io.fail_writes = 20;
-        for _ in 0..10 {
-            assert!(automation.reconcile(None, &mut io).is_err());
-        }
-        assert_eq!(io.calls.len(), 5);
-        assert_eq!(automation.entries["a"].baseline.dpi, 800);
-    }
-
-    #[test]
-    fn explicit_default_preserves_values_and_resets_only_omitted_owned_fields() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo::default();
-        automation
-            .reconcile(Some(&profile("a", Some(1600), Some(2000))), &mut io)
-            .unwrap();
-        let mut default = profile("a", Some(400), None);
-        default.application.name = "Manual default".into();
-        automation.reconcile(Some(&default), &mut io).unwrap();
-        assert_eq!(io.calls.last().unwrap(), "write:a:Some(400):Some(1000)");
-        automation.reconcile(None, &mut io).unwrap();
-        assert_eq!(io.calls.last().unwrap(), "write:a:Some(800):Some(1000)");
-    }
-
-    #[test]
-    fn device_switch_restores_old_identity_before_capturing_new_device() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo::default();
-        automation
-            .reconcile(Some(&profile("a", Some(1600), None)), &mut io)
-            .unwrap();
-        automation
-            .reconcile(Some(&profile("b", Some(3200), None)), &mut io)
-            .unwrap();
-        automation.reconcile(None, &mut io).unwrap();
-        assert_eq!(
-            io.calls,
-            [
-                "read:a",
-                "write:a:Some(1600):None",
-                "write:a:Some(800):None",
-                "read:b",
-                "write:b:Some(3200):None",
-                "write:b:Some(800):None"
-            ]
-        );
-    }
-
-    #[test]
-    fn helper_adapter_binds_read_and_write_to_full_profile_and_captured_identity() {
-        let mut requests = Vec::new();
-        let captured = serde_json::json!({"identity":{"vendorId":1155,"productId":1,"path":"exact","serialNumber":"serial","interface":2},"dpi":800,"pollingRateHz":1000});
-        let mut io = HelperIo(|request: &serde_json::Value| {
-            requests.push(request.clone());
-            Ok(Some(serde_json::to_vec(&captured).unwrap()))
-        });
-        let baseline = io.read("Zaunkoenig:M3K").unwrap();
-        assert_eq!(baseline.dpi, 800);
-        assert_eq!(requests[0]["deviceId"], "Zaunkoenig:M3K");
-        assert_eq!(requests[0]["action"], "automatic-read");
-        let mut io = HelperIo(|request: &serde_json::Value| {
-            assert_eq!(request["identity"]["path"], "exact");
-            assert_eq!(request["identity"]["serialNumber"], "serial");
-            assert_eq!(request["deviceId"], "Zaunkoenig:M3K");
-            assert_eq!(request["action"], "automatic-apply");
-            Ok(Some(
-                serde_json::to_vec(&serde_json::json!({"identity":captured["identity"]})).unwrap(),
-            ))
-        });
-        io.write(
-            "Zaunkoenig:M3K",
-            &baseline,
-            &profile("a", Some(1600), None).settings,
-        )
-        .unwrap();
-        let mut io = HelperIo(|_: &serde_json::Value| -> Result<Option<Vec<u8>>> {
-            panic!("unsupported driver must not launch a helper");
-        });
-        assert!(io.read("Pulsar:Mouse").is_err());
-    }
-
-    #[test]
-    fn helper_adapter_rejects_changed_acknowledgement_identity() {
-        let mut source = FakeIo::default();
-        let baseline = source.read("a").unwrap();
-        let mut io = HelperIo(|_: &serde_json::Value| {
-            Ok(Some(br#"{"identity":{"vendorId":1,"productId":2,"path":"wrong","serialNumber":"serial","interface":0}}"#.to_vec()))
-        });
-        assert!(
-            io.write(
-                "Zaunkoenig:M3K",
-                &baseline,
-                &profile("a", Some(1600), None).settings
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn captures_before_write_and_restores_original_not_handoff() {
-        let mut automation = NativeAutomation::default();
-        let mut io = FakeIo::default();
-        automation
-            .reconcile(Some(&profile("a", Some(1600), Some(2000))), &mut io)
-            .unwrap();
-        automation
-            .reconcile(Some(&profile("a", Some(3200), Some(4000))), &mut io)
-            .unwrap();
-        automation.reconcile(None, &mut io).unwrap();
-        assert_eq!(
-            io.calls,
-            [
-                "read:a",
-                "write:a:Some(1600):Some(2000)",
-                "write:a:Some(3200):Some(4000)",
-                "write:a:Some(800):Some(1000)"
-            ]
-        );
-        assert!(automation.entries.is_empty());
-    }
-}
+mod tests;

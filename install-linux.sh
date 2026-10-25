@@ -203,7 +203,7 @@ write_udev_rule() {
 # Writes the XDG autostart entry Bridge itself uses (see src/platform/linux.rs).
 desktop_exec() {
     local value="$1" character index
-    [[ "$value" != *[$'\001'-$'\037'$'\177']* && "$value" != *=* ]] || return 1
+    [[ "$value" != *[$'\001'-$'\037'$'\177']* ]] || return 1
     for ((index=0; index<${#value}; index++)); do
         character="${value:index:1}"
         case "$character" in
@@ -454,14 +454,14 @@ main() {
 
     # 6. Autostart.
     if [ "$WITH_AUTOSTART" = true ]; then
-        write_autostart "$desktop" "$binary"
+        write_autostart "$desktop" "$binary" || die "could not write autostart entry: invalid path or write failure"
         log "Login autostart enabled."
     fi
 
     # 7. App launcher entry + icon refresh. The zip is expected to ship
     # openmouse-app-icon.png next to the binary (see release.yml Package).
     if [ "$WITH_LAUNCHER" = true ]; then
-        write_launcher "$launcher" "$binary" "$icon"
+        write_launcher "$launcher" "$binary" "$icon" || die "could not write launcher entry: invalid path or write failure"
         update_desktop_database
         log "Launcher entry installed."
     else

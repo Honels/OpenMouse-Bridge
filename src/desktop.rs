@@ -662,6 +662,12 @@ impl TrayApp {
     }
 }
 
+fn should_hide_on_escape(visible: bool, context: &egui::Context) -> bool {
+    visible
+        && context.input(|input| input.key_pressed(egui::Key::Escape))
+        && !egui::Popup::is_any_open(context)
+}
+
 impl eframe::App for TrayApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "linux")]
@@ -710,7 +716,7 @@ impl eframe::App for TrayApp {
                 }
             }
         }
-        if self.visible && context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if should_hide_on_escape(self.visible, context) {
             self.set_visible(context, false);
         }
         if self.visible {
@@ -1823,6 +1829,68 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_keeps_panel_open_until_popup_closes() {
+        let context = egui::Context::default();
+        context
+            .run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: Some(egui::Key::Escape),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    let popup = egui::Id::new("escape-review-popup");
+                    egui::Popup::open_id(ui.ctx(), popup);
+                    assert!(egui::Popup::is_any_open(ui.ctx()));
+                    assert!(!should_hide_on_escape(true, ui.ctx()));
+                    assert!(
+                        egui::Popup::new(popup, ui.ctx().clone(), egui::Pos2::ZERO, ui.layer_id(),)
+                            .open_memory(None)
+                            .show(|ui| ui.label("Popup"))
+                            .is_some()
+                    );
+                    assert!(!egui::Popup::is_any_open(ui.ctx()));
+                },
+            )
+            .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn escape_requires_visible_panel_and_keypress() {
+        for (visible, pressed, expected) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+        ] {
+            egui::Context::default()
+                .run_ui(
+                    egui::RawInput {
+                        events: if pressed {
+                            vec![egui::Event::Key {
+                                key: egui::Key::Escape,
+                                physical_key: Some(egui::Key::Escape),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    |ui| assert_eq!(should_hide_on_escape(visible, ui.ctx()), expected),
+                )
+                .drop_without_applying_deltas();
+        }
+    }
 
     fn simulated_header_drag(start: Pos2, end: Pos2) -> bool {
         let context = egui::Context::default();

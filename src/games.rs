@@ -44,22 +44,22 @@ fn deserialize_executables<'de, D: serde::Deserializer<'de>>(
             mut seq: A,
         ) -> std::result::Result<Self::Value, A::Error> {
             let mut executables = Vec::new();
-            while let Some(name) = seq.next_element::<String>()? {
-                if executables.len() >= MAX_EXECUTABLES
+            while let Some(entry) = seq.next_element::<serde_json::Value>()? {
+                let serde_json::Value::String(name) = entry else {
+                    continue;
+                };
+                if name.len() > MAX_CATALOG_STRING
                     || name.trim().is_empty()
-                    || name.len() > MAX_CATALOG_STRING
                     || name.chars().any(char::is_control)
                 {
+                    continue;
+                }
+                if executables.len() >= MAX_EXECUTABLES {
                     return Err(serde::de::Error::custom(
-                        "invalid catalog executable or executable count",
+                        "catalog executable count exceeds limit",
                     ));
                 }
                 executables.push(name);
-            }
-            if executables.is_empty() {
-                return Err(serde::de::Error::custom(
-                    "catalog game contains no executables",
-                ));
             }
             Ok(executables)
         }
@@ -81,20 +81,24 @@ fn deserialize_games<'de, D: serde::Deserializer<'de>>(
             mut seq: A,
         ) -> std::result::Result<Self::Value, A::Error> {
             let mut games = Vec::new();
+            let mut game_count = 0;
             while let Some(game) = seq.next_element::<CatalogGame>()? {
-                if games.len() >= MAX_CATALOG_GAMES
-                    || game.name.trim().is_empty()
+                if game_count >= MAX_CATALOG_GAMES
                     || game.name.len() > MAX_CATALOG_STRING
+                    || game.name.trim().is_empty()
                     || game.name.chars().any(char::is_control)
                 {
                     return Err(serde::de::Error::custom(
                         "game catalog exceeds item limits or contains invalid strings",
                     ));
                 }
-                games.push(GameConfig {
-                    name: game.name,
-                    executables: game.executables,
-                });
+                game_count += 1;
+                if !game.executables.is_empty() {
+                    games.push(GameConfig {
+                        name: game.name,
+                        executables: game.executables,
+                    });
+                }
             }
             Ok(games)
         }
@@ -424,6 +428,44 @@ mod tests {
                 executables: vec!["cs2.exe".into(), "cs2".into()],
             }]
         );
+    }
+
+    #[test]
+    fn catalog_skips_invalid_executable_entries() {
+        let catalog = serde_json::json!({"games":[{
+            "name":"Mixed",
+            "executables":["ok.exe", "", "   ", "bad\u{0001}.exe", "x".repeat(MAX_CATALOG_STRING + 1), null, false, 42, {}, ["nested"], "other.exe"]
+        }]});
+        let games = parse_catalog(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+        assert_eq!(games[0].executables, ["ok.exe", "other.exe"]);
+    }
+
+    #[test]
+    fn catalog_drops_games_without_valid_executables() {
+        let catalog = serde_json::json!({"games":[
+            {"name":"Invalid", "executables":["", "\n", null]},
+            {"name":"Empty", "executables":[]},
+            {"name":"Valid", "executables":["valid.exe"]}
+        ]});
+        let games = parse_catalog(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+        assert_eq!(
+            games,
+            [GameConfig {
+                name: "Valid".into(),
+                executables: vec!["valid.exe".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn catalog_game_limit_counts_discarded_entries() {
+        let mut entries =
+            vec![serde_json::json!({"name":"Invalid", "executables":[]}); MAX_CATALOG_GAMES];
+        entries.push(serde_json::json!({"name":"Valid", "executables":["valid.exe"]}));
+        let error =
+            parse_catalog(&serde_json::to_vec(&serde_json::json!({"games":entries})).unwrap())
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("game catalog exceeds item limits"));
     }
 
     #[test]
