@@ -5,6 +5,7 @@ pub mod config;
 pub mod drivers;
 pub mod games;
 mod hid;
+pub mod local_targets;
 pub mod platform;
 pub mod remote_image;
 pub mod service;

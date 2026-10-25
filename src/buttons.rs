@@ -771,6 +771,10 @@ mod tests {
                 name: "Game".into(),
                 executable: String::new(),
                 path: String::new(),
+                local_id: None,
+                activation: None,
+                bundle_path: None,
+                bundle_identifier: None,
             },
             device: ProfileDevice {
                 id: device.into(),

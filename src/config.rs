@@ -35,6 +35,8 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub custom_games: Vec<GameConfig>,
     #[serde(default)]
+    pub local_applications: Vec<LocalApplication>,
+    #[serde(default)]
     pub profiles: Vec<ApplicationProfile>,
     #[serde(default)]
     pub default_profile: Option<ApplicationProfile>,
@@ -55,6 +57,45 @@ pub struct BridgeConfig {
 pub struct GameConfig {
     pub name: String,
     pub executables: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalApplication {
+    pub id: String,
+    pub name: String,
+    pub executable: String,
+    pub path: String,
+    pub kind: LocalApplicationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<LocalApplicationActivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_identifier: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalApplicationActivation {
+    Running,
+    Focused,
+}
+
+impl LocalApplication {
+    pub fn effective_activation(&self) -> LocalApplicationActivation {
+        self.activation.unwrap_or(match self.kind {
+            LocalApplicationKind::Game => LocalApplicationActivation::Running,
+            LocalApplicationKind::App => LocalApplicationActivation::Focused,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalApplicationKind {
+    Game,
+    App,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -81,6 +122,12 @@ impl ApplicationProfile {
     /// which only know a game's executables). Lowercased, as matching is.
     pub fn application_key(&self) -> String {
         let application = &self.application;
+        if let Some(id) = &application.local_id {
+            return id.clone();
+        }
+        if !application.path.is_empty() {
+            return crate::games::path_key(&application.path);
+        }
         [
             &application.path,
             &application.executable,
@@ -99,6 +146,14 @@ pub struct ProfileApplication {
     pub name: String,
     pub executable: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<LocalApplicationActivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_identifier: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -131,6 +186,7 @@ impl Default for BridgeConfig {
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
             games: Vec::new(),
             custom_games: Vec::new(),
+            local_applications: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: default_origins(),
@@ -154,15 +210,21 @@ impl BridgeConfig {
             profile.device.id = profile.device.id.trim().to_owned();
             profile.device.name = profile.device.name.trim().to_owned();
         }
+        for profile in self
+            .profiles
+            .iter_mut()
+            .chain(self.default_profile.iter_mut())
+        {
+            let _ = crate::local_targets::canonicalize_profile(profile, &self.local_applications);
+        }
         // Game profiles from the control panel carry no path (a game is known
         // by its executables), so a profile only needs something to match on.
         self.profiles.retain(|profile| {
             !profile.application_key().is_empty() && !profile.device.id.is_empty()
         });
-        self.profiles
-            .sort_by_cached_key(|profile| (profile.application_key(), profile.device.id.clone()));
-        self.profiles.dedup_by(|left, right| {
-            left.application_key() == right.application_key() && left.device.id == right.device.id
+        let mut identities = std::collections::HashSet::new();
+        self.profiles.retain(|profile| {
+            identities.insert((profile.application_key(), profile.device.id.clone()))
         });
         if let Some(profile) = &mut self.default_profile {
             profile.application.name = profile.application.name.trim().to_owned();
@@ -288,12 +350,42 @@ pub async fn load_with_catalog() -> Result<(BridgeConfig, PathBuf)> {
 }
 
 pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
     let json = serde_json::to_vec_pretty(config)?;
-    fs::write(path, json).with_context(|| format!("could not write {}", path.display()))
+    let name = path
+        .file_name()
+        .context("config path has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_SAVE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("could not create {}", temporary.display()))?;
+    let result: std::io::Result<()> = (|| {
+        file.write_all(&json)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("could not write {}", path.display()))
 }
 
 const fn default_battery_threshold() -> u8 {
@@ -368,6 +460,74 @@ mod tests {
     }
 
     #[test]
+    fn saving_replaces_the_file_instead_of_truncating_an_existing_reader() {
+        use std::io::Read;
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("atomic-config-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.json");
+        fs::write(&path, b"old configuration").unwrap();
+        let mut original = fs::File::open(&path).unwrap();
+        save(&path, &BridgeConfig::default()).unwrap();
+        let mut bytes = Vec::new();
+        original.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"old configuration");
+        assert!(serde_json::from_slice::<BridgeConfig>(&fs::read(&path).unwrap()).is_ok());
+        drop(original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn local_profile_metadata_is_canonical_after_config_reload() {
+        let json = serde_json::json!({"localApplications":[{"id":"local:editor","name":" Editor ","executable":"editor.exe","path":"C:/Tools/editor.exe","kind":"app"}],"profiles":[{"application":{"localId":"local:editor","name":"Old name","executable":"old.exe","path":"C:/Old/old.exe"},"device":{"id":"d","name":"Mouse"},"settings":{"dpi":800}}]});
+        let config: BridgeConfig = serde_json::from_value(json).unwrap();
+        let config = config.normalized();
+        assert_eq!(
+            config.profiles[0].application.name,
+            config.local_applications[0].name
+        );
+        assert_eq!(config.profiles[0].application.executable, "editor.exe");
+        assert_eq!(config.profiles[0].application.path, "C:/Tools/editor.exe");
+    }
+
+    #[test]
+    fn local_profile_identity_is_not_its_display_name_or_executable() {
+        let json = serde_json::json!({"profiles": [
+            {"application":{"name":"Editor","executable":"editor.exe","path":"","localId":"local:one"}, "device":{"id":"d","name":"Mouse"},"settings":{}},
+            {"application":{"name":"Editor","executable":"editor.exe","path":"","localId":"local:two"}, "device":{"id":"d","name":"Mouse"},"settings":{}},
+            {"application":{"name":"Editor","executable":"editor.exe","path":""}, "device":{"id":"d","name":"Mouse"},"settings":{}}
+        ]});
+        let config: BridgeConfig = serde_json::from_value(json).unwrap();
+        let saved = serde_json::to_value(config.normalized()).unwrap();
+        assert_eq!(saved["profiles"].as_array().unwrap().len(), 3);
+        assert!(
+            saved["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["application"]["localId"] == "local:one")
+        );
+    }
+
+    #[test]
+    fn local_targets_survive_config_roundtrip_and_catalog_refresh() {
+        let json = serde_json::json!({"localApplications": [{"id":"local:editor", "name":"Editor", "executable":"editor.exe", "path":"C:/Tools/editor.exe", "kind":"app"}]});
+        let mut config: BridgeConfig = serde_json::from_value(json.clone()).unwrap();
+        config.games = vec![GameConfig {
+            name: "Preset".into(),
+            executables: vec!["preset.exe".into()],
+        }];
+        let saved = serde_json::to_value(config.normalized()).unwrap();
+        assert_eq!(saved["localApplications"], json["localApplications"]);
+        let legacy: BridgeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap()["localApplications"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
     fn normalization_clamps_threshold_and_cleans_executables() {
         let config = BridgeConfig {
             battery_threshold_percent: 140,
@@ -383,6 +543,7 @@ mod tests {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
+            local_applications: Vec::new(),
             autostart_configured: false,
             tray_hint_shown: false,
         }
@@ -452,6 +613,10 @@ mod tests {
                 name: name.into(),
                 executable: executable.into(),
                 path: String::new(),
+                local_id: None,
+                activation: None,
+                bundle_path: None,
+                bundle_identifier: None,
             },
             device: ProfileDevice {
                 id: device.into(),

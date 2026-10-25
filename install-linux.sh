@@ -204,8 +204,30 @@ write_udev_rule() {
 }
 
 # Writes the XDG autostart entry Bridge itself uses (see src/platform/linux.rs).
+desktop_exec() {
+    local value="$1" character index
+    [[ "$value" != *[$'\001'-$'\037'$'\177']* ]] || return 1
+    for ((index=0; index<${#value}; index++)); do
+        character="${value:index:1}"
+        case "$character" in
+            '%') printf '%s' '%%' ;;
+            '\') printf '%s' '\\\\' ;;
+            '"'|'$'|'`') printf '%s%s' '\\' "$character" ;;
+            *) printf '%s' "$character" ;;
+        esac
+    done
+}
+
+startup_config_home() {
+    case "${XDG_CONFIG_HOME:-}" in
+        /*) printf '%s' "$XDG_CONFIG_HOME" ;;
+        *) printf '%s' "$HOME/.config" ;;
+    esac
+}
+
 write_autostart() {
-    local path="$1" exec="$2"
+    local path="$1" exec
+    exec=$(desktop_exec "$2") || return 1
     mkdir -p "$(dirname "$path")"
     cat >"$path" <<EOF
 [Desktop Entry]
@@ -223,7 +245,10 @@ EOF
 # opens another copy, so SingleMainWindow keeps the launcher from stacking
 # duplicate icons while it runs.
 write_launcher() {
-    local path="$1" exec="$2" icon="$3"
+    local path="$1" exec icon="$3"
+    exec=$(desktop_exec "$2") || return 1
+    [[ "$icon" != *[$'\001'-$'\037'$'\177']* ]] || return 1
+    icon="${icon//\\/\\\\}"
     mkdir -p "$(dirname "$path")"
     cat >"$path" <<EOF
 [Desktop Entry]
@@ -304,7 +329,7 @@ main() {
     fi
     local binary="$INSTALL_DIR/openmouse-bridge"
     local link="$BIN_LINK_DIR/openmouse-bridge"
-    local desktop="$HOME/.config/autostart/io.openmouse.bridge.desktop"
+    local desktop="$(startup_config_home)/autostart/io.openmouse.bridge.desktop"
     # GNOME/KDE launcher: user-local always, so it never needs root and
     # --uninstall can remove it without sudo. Icon path is absolute because
     # launchers do not resolve relative to the .desktop location.
@@ -436,14 +461,14 @@ main() {
 
     # 6. Autostart.
     if [ "$WITH_AUTOSTART" = true ]; then
-        write_autostart "$desktop" "$binary"
+        write_autostart "$desktop" "$binary" || die "could not write autostart entry: invalid path or write failure"
         log "Login autostart enabled."
     fi
 
     # 7. App launcher entry + icon refresh. The zip is expected to ship
     # openmouse-app-icon.png next to the binary (see release.yml Package).
     if [ "$WITH_LAUNCHER" = true ]; then
-        write_launcher "$launcher" "$binary" "$icon"
+        write_launcher "$launcher" "$binary" "$icon" || die "could not write launcher entry: invalid path or write failure"
         update_desktop_database
         log "Launcher entry installed."
     else
