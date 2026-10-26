@@ -600,27 +600,27 @@ impl HidSession {
                 self.device_keys.insert(device_id, key.clone());
                 key
             };
-             if !self.candidates.contains_key(&key) {
-                 // One device that cannot be inspected safely must not hide every
-                 // other device: skip it and keep listing the rest.
-                 match inspect_candidate(&self.api, key.clone(), &infos) {
-                     Ok(candidate) => {
-                         self.candidates.insert(key.clone(), candidate);
-                     }
-                     Err(error) => {
-                         tracing::warn!(
-                             session_id = self.session_id,
-                             device_key = %key,
-                             vendor_id = format_args!("{:#06x}", infos[0].vendor_id()),
-                             product_id = format_args!("{:#06x}", infos[0].product_id()),
-                             product_name = infos[0].product_string().unwrap_or_default(),
-                             path_count = infos.len(),
-                             %error,
-                             "HID device skipped"
-                         );
-                         continue;
-                     }
-                 }
+            if !self.candidates.contains_key(&key) {
+                // One device that cannot be inspected safely must not hide every
+                // other device: skip it and keep listing the rest.
+                match inspect_candidate(&self.api, key.clone(), &infos) {
+                    Ok(candidate) => {
+                        self.candidates.insert(key.clone(), candidate);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = self.session_id,
+                            device_key = %key,
+                            vendor_id = format_args!("{:#06x}", infos[0].vendor_id()),
+                            product_id = format_args!("{:#06x}", infos[0].product_id()),
+                            product_name = infos[0].product_string().unwrap_or_default(),
+                            path_count = infos.len(),
+                            %error,
+                            "HID device skipped"
+                        );
+                        continue;
+                    }
+                }
             }
             if let Some(candidate) = self.candidates.get(&key) {
                 summaries.push(candidate.summary.clone());
