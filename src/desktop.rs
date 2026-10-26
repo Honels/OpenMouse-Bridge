@@ -2025,6 +2025,9 @@ mod tests {
             games: vec![],
             tracked_game_count: 0,
             battery_threshold_percent: 20,
+            tray_battery_style: "glyph".to_owned(),
+            hybrid_mode: true,
+            device_mode: "onboard".to_owned(),
             autostart_enabled: false,
             automatic_updates: false,
             notification_sound: true,
@@ -2053,6 +2056,10 @@ mod tests {
                 percent: 60,
                 charging: false,
                 stale: true,
+                minutes_remaining: None,
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
             });
         assert_eq!(device_label(Some(&snapshot)), "No mouse session");
     }
@@ -2079,6 +2086,10 @@ mod tests {
             percent: 60,
             charging: true,
             stale: true,
+            minutes_remaining: None,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
         };
         assert_eq!(battery_text(&battery), "60% · Last known (was charging)");
     }
@@ -2162,6 +2173,10 @@ mod tests {
             percent: 42,
             charging: false,
             stale: false,
+            minutes_remaining: None,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
         };
         assert_eq!(battery_text(&battery), "42%");
         battery.charging = true;

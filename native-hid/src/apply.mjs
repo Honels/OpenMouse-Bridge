@@ -6,9 +6,14 @@
 // Usage: node apply.mjs < request.json
 //   stdin: {"brand": "Razer", "dpi": 800, "pollingRateHz": 1000}
 //   (dpi / pollingRateHz are each optional — omit to leave that setting alone)
+//   stdin: {"brand": "Razer", "dpi": 800, "settings": {"lightforceSwitchMode": "Optical"}}
+//   (settings carries the panel's stored MouseStatus fields; ones the driver
+//   supports are applied, the rest are reported and skipped)
 //   stdin: {"brand": "Razer", "action": "status"}
-//   reads the mouse's status instead and prints its battery fields as JSON on
-//   stdout: {"batteryPercent": 41, "batteryState": "Discharging"}
+//   reads the mouse's status instead and prints it as JSON on stdout:
+//   {"batteryPercent": 41, "batteryState": "Discharging",
+//    "deviceName": "G Pro X Superlight 2", "dpi": 800, "pollingRateHz": 1000,
+//    "switchMode": "Optical"}  (settings fields null when unreadable)
 //
 // Exit codes (Bridge's src/drivers/native_hid.rs depends on this contract):
 //   0  — a device was found and the requested settings were applied (or, in
@@ -138,6 +143,16 @@ async function main() {
       JSON.stringify({
         batteryPercent: status?.batteryPercent ?? null,
         batteryState: status?.batteryState ?? null,
+        // The driver's own model name (MouseStatus.name) — better than the
+        // receiver-level name Bridge's discovery gets from the HID
+        // descriptor (a LIGHTSPEED receiver reports "USB Receiver").
+        deviceName: status?.name ?? null,
+        // The settings currently in the device's onboard memory, for the
+        // tray panel's device summary. MouseStatus reports them whenever
+        // the driver can read them.
+        dpi: status?.dpi ?? null,
+        pollingRateHz: status?.pollingRateHz ?? null,
+        switchMode: status?.lightforceSwitchMode ?? null,
       }),
     );
     await client.close().catch(() => undefined);
@@ -203,6 +218,43 @@ async function main() {
     console.error(`[native-hid] could not apply settings: ${error.message}`);
     await client.close().catch(() => undefined);
     process.exit(EXIT_FAILED);
+  }
+
+  // ── Panel snapshot fields ────────────────────────────────────────────
+  // Bridge stores the panel's opaque MouseStatus fields alongside the
+  // numeric settings and hands them back here for onboard-memory mode.
+  // Only fields with a feature-detected driver method are applied; the
+  // rest are reported and skipped.
+  if (input.settings && typeof input.settings === "object" && !Array.isArray(input.settings)) {
+    const settings = input.settings;
+    const skipped = [];
+    if (
+      typeof settings.lightforceSwitchMode === "string" &&
+      typeof client.setLightforceSwitchMode === "function"
+    ) {
+      try {
+        await withTimeout(
+          client.setLightforceSwitchMode(settings.lightforceSwitchMode),
+          PROBE_TIMEOUT_MS,
+          "setLightforceSwitchMode",
+        );
+      } catch (error) {
+        console.error(`[native-hid] could not apply lightforceSwitchMode: ${error.message}`);
+        await client.close().catch(() => undefined);
+        process.exit(EXIT_FAILED);
+      }
+    } else if (typeof settings.lightforceSwitchMode === "string") {
+      skipped.push("lightforceSwitchMode");
+    }
+    const known = ["lightforceSwitchMode"];
+    for (const field of Object.keys(settings)) {
+      if (!known.includes(field) && settings[field] !== null && settings[field] !== undefined) {
+        skipped.push(field);
+      }
+    }
+    if (skipped.length > 0) {
+      console.error(`[native-hid] no native support for: ${skipped.join(", ")} — skipped.`);
+    }
   }
 
   await client.close().catch(() => undefined);

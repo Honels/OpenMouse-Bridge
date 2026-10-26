@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use crate::{
     applications::{self, ApplicationInfo},
     config::{self, ApplicationProfile, BridgeConfig, GameConfig, LocalApplication},
+    drivers,
     games::GameDetector,
     platform,
 };
@@ -98,12 +99,31 @@ const PROFILE_DEBOUNCE: Duration = Duration::from_millis(2500);
 /// without the control panel open. Each read spawns the native-hid helper.
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// A reading older than this is shown as stale: more than two missed polls.
+/// A reading this old is shown as stale: more than two missed polls.
 const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
 
 /// A reading this old belongs to a mouse that is gone, not just asleep: it is
 /// dropped from the list instead of lingering as a ghost device.
 const BATTERY_EVICT_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many samples of each device's percent history are kept for the tray
+/// tooltip's time-remaining estimate.
+const BATTERY_HISTORY_SAMPLES: usize = 48;
+
+/// Percent samples older than this no longer count toward a trend, so a
+/// mouse's days-old readings never poison the estimate.
+const BATTERY_TREND_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// A trend needs at least this much history before an estimate is worth
+/// showing: two samples 5 minutes apart are mostly quantization noise.
+const BATTERY_MIN_TREND_SPAN: Duration = Duration::from_secs(30 * 60);
+
+/// The smallest drift (percent per minute) that counts as a trend, about 1%
+/// per 3 hours — the pace a mouse battery actually moves at.
+const BATTERY_TREND_EPSILON: f64 = 0.005;
+
+/// Estimates beyond this are noise for a mouse battery, not a plan.
+const BATTERY_MAX_ESTIMATE_MINUTES: u32 = 48 * 60;
 
 /// Drops battery entries that can no longer describe a live mouse: anything
 /// past `BATTERY_EVICT_AFTER`, and anything outside the saved profiles that
@@ -440,6 +460,15 @@ pub struct BridgeService {
     native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
 }
 
+/// A control panel is connected when it holds a HID WebSocket session or
+/// handshook within the last few seconds.
+fn panel_connected(state: &BridgeState) -> bool {
+    crate::hid::client_session_active()
+        || state
+            .last_client_heartbeat
+            .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(20))
+}
+
 struct BridgeState {
     config: BridgeConfig,
     active_games: Vec<String>,
@@ -459,6 +488,28 @@ struct BridgeState {
     profile_seeded: bool,
     started_at: Instant,
     last_client_heartbeat: Option<Instant>,
+    /// Who currently drives the mouse: Bridge in onboard memory mode or the
+    /// web panel in live mode. Tracked by the mode monitor.
+    device_mode: DeviceMode,
+}
+
+/// Who currently drives the mouse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceMode {
+    /// Bridge drives the mouse itself: the active profile's stored settings
+    /// live in the onboard memory and the battery is read natively.
+    Onboard,
+    /// The OpenMouse web panel holds the HID session and drives the mouse.
+    Live,
+}
+
+impl DeviceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Onboard => "onboard",
+            Self::Live => "live",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -469,6 +520,15 @@ pub struct BatteryReading {
     pub percent: u8,
     #[serde(default)]
     pub charging: bool,
+    /// The settings currently in the mouse's onboard memory, when the
+    /// reader could see them — native reads report them; a control panel's
+    /// `PUT /v1/battery` may not.
+    #[serde(default)]
+    pub dpi: Option<u32>,
+    #[serde(default)]
+    pub polling_rate_hz: Option<u32>,
+    #[serde(default)]
+    pub switch_mode: Option<String>,
 }
 
 struct BatteryState {
@@ -476,7 +536,46 @@ struct BatteryState {
     device_name: String,
     percent: u8,
     charging: bool,
+    dpi: Option<u32>,
+    polling_rate_hz: Option<u32>,
+    switch_mode: Option<String>,
     updated_at: Instant,
+    // Recent (reading time, percent) samples, oldest first, for the tray
+    // tooltip's time-remaining estimate.
+    history: VecDeque<(Instant, u8)>,
+}
+
+/// Estimates the minutes left until the battery is empty (discharging) or
+/// full (charging) from the percent history: the level's drift across the
+/// samples inside the trend window. `None` while there is no confident
+/// trend yet — too little history, or the level is holding still.
+fn estimate_minutes_remaining(
+    history: &VecDeque<(Instant, u8)>,
+    percent: u8,
+    charging: bool,
+) -> Option<u32> {
+    let now = Instant::now();
+    let recent = |at: &Instant| now.duration_since(*at) <= BATTERY_TREND_WINDOW;
+    let (first_at, first_percent) = history.iter().find(|(at, _)| recent(at))?;
+    let (last_at, last_percent) = history.iter().rev().find(|(at, _)| recent(at))?;
+    if last_at <= first_at {
+        return None;
+    }
+    let span = last_at.duration_since(*first_at);
+    if span < BATTERY_MIN_TREND_SPAN {
+        return None;
+    }
+    let span_minutes = span.as_secs_f64() / 60.0;
+    let rate = f64::from(*last_percent as i16 - *first_percent as i16) / span_minutes;
+    let raw_minutes = if charging {
+        (rate > BATTERY_TREND_EPSILON).then(|| f64::from(100 - percent) / rate)?
+    } else {
+        (rate < -BATTERY_TREND_EPSILON).then(|| f64::from(percent) / -rate)?
+    };
+    // Round to 5-minute granularity so the estimate holds still instead of
+    // jittering every snapshot.
+    let minutes = (raw_minutes / 5.0).round() as u32 * 5;
+    (minutes > 0 && minutes <= BATTERY_MAX_ESTIMATE_MINUTES).then_some(minutes)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -487,6 +586,18 @@ pub struct DeviceBattery {
     pub percent: u8,
     pub charging: bool,
     pub stale: bool,
+    /// Minutes until the battery is empty (discharging) or full (charging),
+    /// from the recent trend; `None` while there is no confident estimate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minutes_remaining: Option<u32>,
+    /// The settings currently in the mouse's onboard memory, from the most
+    /// recent native status read; `None` when unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dpi: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polling_rate_hz: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_mode: Option<String>,
 }
 
 /// A mouse the control panel currently holds open over native HID, most
@@ -521,6 +632,12 @@ pub struct BridgeSnapshot {
     pub games: Vec<GameActivity>,
     pub tracked_game_count: usize,
     pub battery_threshold_percent: u8,
+    pub tray_battery_style: String,
+    pub hybrid_mode: bool,
+    /// Who drives the mouse right now: `"onboard"` (Bridge applies the
+    /// stored settings and reads the battery) or `"live"` (the web panel
+    /// holds the HID session).
+    pub device_mode: String,
     pub autostart_enabled: bool,
     pub automatic_updates: bool,
     pub notification_sound: bool,
@@ -556,6 +673,7 @@ impl BridgeService {
                 profile_seeded: false,
                 started_at: Instant::now(),
                 last_client_heartbeat: None,
+                device_mode: DeviceMode::Onboard,
             })),
             config_path: Arc::new(config_path),
             notice_listener: Arc::default(),
@@ -629,10 +747,8 @@ impl BridgeService {
 
     pub async fn snapshot(&self) -> BridgeSnapshot {
         let state = self.inner.read().await;
-        let client_connected = crate::hid::client_session_active()
-            || state
-                .last_client_heartbeat
-                .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(20));
+        let client_connected = panel_connected(&state);
+        let device_mode = state.device_mode;
         let foreground_application = state
             .applications
             .iter()
@@ -652,12 +768,23 @@ impl BridgeService {
             .battery
             .iter()
             .filter(|(_, entry)| entry.updated_at.elapsed() < BATTERY_EVICT_AFTER)
-            .map(|(device_id, entry)| DeviceBattery {
-                device_id: device_id.clone(),
-                device_name: entry.device_name.clone(),
-                percent: entry.percent,
-                charging: entry.charging,
-                stale: entry.updated_at.elapsed() >= BATTERY_STALE_AFTER,
+            .map(|(device_id, entry)| {
+                let stale = entry.updated_at.elapsed() >= BATTERY_STALE_AFTER;
+                DeviceBattery {
+                    device_id: device_id.clone(),
+                    device_name: entry.device_name.clone(),
+                    percent: entry.percent,
+                    charging: entry.charging,
+                    minutes_remaining: if stale {
+                        None
+                    } else {
+                        estimate_minutes_remaining(&entry.history, entry.percent, entry.charging)
+                    },
+                    dpi: entry.dpi,
+                    polling_rate_hz: entry.polling_rate_hz,
+                    switch_mode: entry.switch_mode.clone(),
+                    stale,
+                }
             })
             .collect::<Vec<_>>();
         batteries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
@@ -719,6 +846,9 @@ impl BridgeService {
                     .filter(|target| target.kind == config::LocalApplicationKind::Game)
                     .count(),
             battery_threshold_percent: state.config.battery_threshold_percent,
+            tray_battery_style: state.config.tray_battery_style.clone(),
+            hybrid_mode: state.config.hybrid_mode,
+            device_mode: device_mode.as_str().to_owned(),
             autostart_enabled: platform::autostart_enabled(),
             automatic_updates: state.config.automatic_updates,
             notification_sound: state.config.notification_sound,
@@ -932,6 +1062,25 @@ impl BridgeService {
         .await
     }
 
+    pub async fn set_tray_battery_style(&self, style: &str) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.tray_battery_style = style.to_owned();
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
+    pub async fn set_hybrid_mode(&self, enabled: bool) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.hybrid_mode = enabled;
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
     pub async fn set_automatic_updates(&self, enabled: bool) -> Result<()> {
         self.update_config(|config| {
             config.automatic_updates = enabled;
@@ -970,13 +1119,24 @@ impl BridgeService {
             let mut state = self.inner.write().await;
             let threshold = state.config.battery_threshold_percent;
             let cooldown = Duration::from_secs(state.config.alert_cooldown_minutes * 60);
-            let previous_alert = state
-                .battery
-                .get(&reading.device_id)
-                .and_then(|entry| entry.last_alert);
+            let previous = state.battery.get(&reading.device_id);
+            let previous_alert = previous.and_then(|entry| entry.last_alert);
             let should_alert = !reading.charging
                 && reading.percent <= threshold
                 && previous_alert.is_none_or(|last| last.elapsed() >= cooldown);
+            let mut history = previous
+                .map(|entry| entry.history.clone())
+                .unwrap_or_default();
+            history.push_back((Instant::now(), reading.percent));
+            while history.len() > BATTERY_HISTORY_SAMPLES {
+                history.pop_front();
+            }
+            // A control panel's `PUT /v1/battery` reports the charge level
+            // only; keep the settings a previous native status read saw
+            // instead of blanking them until the next native poll.
+            let (previous_dpi, previous_rate, previous_mode) = previous
+                .map(|entry| (entry.dpi, entry.polling_rate_hz, entry.switch_mode.clone()))
+                .unwrap_or((None, None, None));
             state.battery.insert(
                 reading.device_id.clone(),
                 BatteryState {
@@ -988,7 +1148,11 @@ impl BridgeService {
                     device_name: reading.device_name.clone(),
                     percent: reading.percent,
                     charging: reading.charging,
+                    dpi: reading.dpi.or(previous_dpi),
+                    polling_rate_hz: reading.polling_rate_hz.or(previous_rate),
+                    switch_mode: reading.switch_mode.or(previous_mode),
                     updated_at: Instant::now(),
+                    history,
                 },
             );
             should_alert
@@ -1016,39 +1180,52 @@ impl BridgeService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                let devices = profile_devices(&service.inner.read().await.config);
-                // Pruning is in-memory only, so it runs even while the
-                // control panel holds a HID session and reads are paused.
-                prune_batteries(&mut service.inner.write().await.battery, &devices);
-                if crate::hid::client_session_active() {
+                poll_batteries_once(service.clone()).await;
+            }
+        });
+    }
+
+    /// Watches the connection state and flips between the two halves of
+    /// hybrid mode: while the OpenMouse web panel is disconnected, Bridge
+    /// drives the mouse in onboard memory mode (stored settings applied,
+    /// battery read natively); the moment the panel connects it takes the
+    /// mouse over live, and when it leaves, Bridge restores the stored
+    /// settings and reads the battery right away.
+    pub fn start_mode_monitor(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let mode = {
+                    let state = service.inner.read().await;
+                    if panel_connected(&state) {
+                        DeviceMode::Live
+                    } else {
+                        DeviceMode::Onboard
+                    }
+                };
+                let previous = {
+                    let mut state = service.inner.write().await;
+                    let previous = state.device_mode;
+                    state.device_mode = mode;
+                    previous
+                };
+                if previous == mode {
                     continue;
                 }
-                for (device_id, device_name) in devices {
-                    let id = device_id.clone();
-                    let outcome =
-                        tokio::task::spawn_blocking(move || crate::drivers::read_battery(&id))
-                            .await;
-                    match outcome {
-                        Ok(Ok(Some(battery))) => {
-                            let reading = BatteryReading {
-                                device_id,
-                                device_name,
-                                percent: battery.percent,
-                                charging: battery.charging,
-                            };
-                            if let Err(error) = service.record_battery(reading).await {
-                                tracing::warn!(%error, "Could not record the mouse battery");
-                            }
+                match mode {
+                    DeviceMode::Live => {
+                        tracing::info!("the web panel connected — it drives the mouse live now");
+                    }
+                    DeviceMode::Onboard => {
+                        tracing::info!("the web panel disconnected — resuming onboard memory mode");
+                        let hybrid = service.inner.read().await.config.hybrid_mode;
+                        if !hybrid {
+                            continue;
                         }
-                        Ok(Ok(None)) => {
-                            tracing::debug!(%device_id, "No native battery reader for this device");
-                        }
-                        Ok(Err(error)) => {
-                            tracing::debug!(%error, %device_id, "Could not read the mouse battery");
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "The battery reader stopped unexpectedly");
-                        }
+                        resume_onboard(&service).await;
                     }
                 }
             }
@@ -1238,6 +1415,158 @@ impl BridgeService {
                 }
             }
         });
+    }
+}
+
+/// One battery-polling pass: covers every device named by the saved profiles
+/// plus every mouse Bridge discovered on the HID bus whose brand no profile
+/// already names, reads each mouse's battery natively (skipped while the web
+/// panel holds the session — it reports the battery itself over
+/// `PUT /v1/battery`) and records it. Used by the five-minute monitor and by
+/// onboard-mode handovers.
+async fn poll_batteries_once(service: BridgeService) {
+    let profiled = profile_devices(&service.inner.read().await.config);
+    let discovered = tokio::task::spawn_blocking(drivers::detect_mice)
+        .await
+        .unwrap_or_default();
+    let devices = merge_detected_mice(profiled, &discovered);
+    // Pruning is in-memory only, so it runs even while the
+    // control panel holds a HID session and reads are paused.
+    prune_batteries(&mut service.inner.write().await.battery, &devices);
+    if crate::hid::client_session_active() {
+        return;
+    }
+    for (device_id, device_name) in devices {
+        let id = device_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || crate::drivers::read_status(&id)).await;
+        match outcome {
+            Ok(Ok(Some(status))) => {
+                // The web panel reports batteries as `<brand>:<model>` (the
+                // driver's own model name), while discovery ids use the HID
+                // descriptor's tail (a LIGHTSPEED receiver reads
+                // `Logitech:046d:c547`). Recording under the panel's name
+                // for the same physical mouse keeps one entry instead of
+                // duplicate rows; the discovery-shaped entry is dropped.
+                let record_id = status
+                    .battery
+                    .reported_name
+                    .as_ref()
+                    .map(|name| canonical_battery_identity(&device_id, name))
+                    .unwrap_or_else(|| device_id.clone());
+                if record_id != device_id {
+                    service.inner.write().await.battery.remove(&device_id);
+                }
+                let record_name = status.battery.reported_name.clone().unwrap_or(device_name);
+                let reading = BatteryReading {
+                    device_id: record_id,
+                    device_name: record_name,
+                    percent: status.battery.percent,
+                    charging: status.battery.charging,
+                    dpi: status.dpi,
+                    polling_rate_hz: status.polling_rate_hz,
+                    switch_mode: status.switch_mode,
+                };
+                if let Err(error) = service.record_battery(reading).await {
+                    tracing::warn!(%error, "Could not record the mouse battery");
+                }
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(%device_id, "No native battery reader for this device");
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(%error, %device_id, "Could not read the mouse battery");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "The battery reader stopped unexpectedly");
+            }
+        }
+    }
+}
+
+/// The device id the web panel would use for the same physical mouse:
+/// `<brand>:<model>`, from the driver's own `MouseStatus.name`.
+fn canonical_battery_identity(device_id: &str, reported_name: &str) -> String {
+    let brand = device_id.split(':').next().unwrap_or_default();
+    format!("{brand}:{reported_name}")
+}
+
+/// The devices battery polling should cover: the saved profiles' devices plus
+/// discovered mice whose brand no profile already names — discovery fills the
+/// gap before the panel has ever saved a profile, without double-reporting a
+/// mouse a profile already covers (profile and discovery ids for the same
+/// physical mouse differ, so brand-level dedup keeps one battery entry).
+fn merge_detected_mice(
+    mut profiled: Vec<(String, String)>,
+    detected: &[drivers::DetectedMouse],
+) -> Vec<(String, String)> {
+    for mouse in detected {
+        let brand = mouse.device_id.split(':').next().unwrap_or_default();
+        let already_covered = profiled.iter().any(|(id, _)| {
+            id.split(':')
+                .next()
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(brand))
+        });
+        if !already_covered {
+            profiled.push((mouse.device_id.clone(), mouse.name.clone()));
+        }
+    }
+    profiled
+}
+
+/// Enters onboard memory mode: pushes the stored settings to the mouse's
+/// onboard memory (when a default profile exists — without one, the device
+/// simply keeps the memory it already has) and reads the battery right away.
+/// Shared by the startup seed and the panel-disconnect handover.
+async fn resume_onboard(service: &BridgeService) {
+    let profile = {
+        let state = service.inner.read().await;
+        resolve_profile_retaining(
+            &state.config,
+            &state.applications,
+            &state.active_games,
+            &state.processes,
+            None,
+        )
+    };
+    if let Some(profile) = profile {
+        tracing::info!(
+            profile = %profile.application.name,
+            "applying the stored settings to the onboard memory"
+        );
+        std::thread::spawn(move || {
+            apply_natively(&profile);
+        });
+    }
+    tokio::spawn(poll_batteries_once(service.clone()));
+}
+
+fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
+    match crate::drivers::apply_profile(profile) {
+        Ok(true) => {
+            tracing::info!(
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "Applied the mouse profile natively"
+            );
+            ApplyOutcome::Applied
+        }
+        Ok(false) => {
+            tracing::debug!(
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "No native driver for this device; not applying natively"
+            );
+            ApplyOutcome::NoDriver
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "Could not apply the mouse profile natively"
+            );
+            ApplyOutcome::Failed
+        }
     }
 }
 
@@ -1986,6 +2315,9 @@ mod tests {
                     device_name: "Mouse".into(),
                     percent: 90,
                     charging: false,
+                    dpi: None,
+                    polling_rate_hz: None,
+                    switch_mode: None,
                 })
                 .await
                 .unwrap()
@@ -1997,10 +2329,55 @@ mod tests {
                     device_name: "Mouse".into(),
                     percent: 10,
                     charging: true,
+                    dpi: None,
+                    polling_rate_hz: None,
+                    switch_mode: None,
                 })
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn settings_less_panel_reports_keep_the_stored_settings() {
+        let bridge = service(BridgeConfig::default());
+        // Native status read: battery plus onboard settings.
+        bridge
+            .record_battery(BatteryReading {
+                device_id: "Logitech:PRO X SUPERLIGHT 2 SE".into(),
+                device_name: "PRO X SUPERLIGHT 2 SE".into(),
+                percent: 81,
+                charging: false,
+                dpi: Some(800),
+                polling_rate_hz: Some(1000),
+                switch_mode: Some("Hybrid".into()),
+            })
+            .await
+            .unwrap();
+        // The panel's PUT carries the charge level only.
+        bridge
+            .record_battery(BatteryReading {
+                device_id: "Logitech:PRO X SUPERLIGHT 2 SE".into(),
+                device_name: "PRO X SUPERLIGHT 2 SE".into(),
+                percent: 80,
+                charging: false,
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+            })
+            .await
+            .unwrap();
+        let battery = bridge
+            .snapshot()
+            .await
+            .batteries
+            .into_iter()
+            .next()
+            .expect("battery entry survives");
+        assert_eq!(battery.percent, 80);
+        assert_eq!(battery.dpi, Some(800));
+        assert_eq!(battery.polling_rate_hz, Some(1000));
+        assert_eq!(battery.switch_mode.as_deref(), Some("Hybrid"));
     }
 
     fn battery_entry(age: Duration) -> BatteryState {
@@ -2009,8 +2386,56 @@ mod tests {
             device_name: "Mouse".into(),
             percent: 50,
             charging: false,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
             updated_at: Instant::now() - age,
+            history: VecDeque::new(),
         }
+    }
+
+    fn history(minutes_ago_percent: &[(u64, u8)]) -> VecDeque<(Instant, u8)> {
+        let now = Instant::now();
+        minutes_ago_percent
+            .iter()
+            .map(|(minutes_ago, percent)| (now - Duration::from_secs(minutes_ago * 60), *percent))
+            .collect()
+    }
+
+    #[test]
+    fn a_steady_drain_estimates_time_to_empty() {
+        let samples = history(&[(60, 50), (30, 48), (0, 45)]);
+        assert_eq!(estimate_minutes_remaining(&samples, 45, false), Some(540));
+    }
+
+    #[test]
+    fn a_steady_charge_estimates_time_to_full() {
+        let samples = history(&[(60, 20), (0, 80)]);
+        assert_eq!(estimate_minutes_remaining(&samples, 80, true), Some(20));
+    }
+
+    #[test]
+    fn a_flat_level_has_no_estimate() {
+        let samples = history(&[(60, 50), (0, 50)]);
+        assert_eq!(estimate_minutes_remaining(&samples, 50, false), None);
+    }
+
+    #[test]
+    fn too_little_history_has_no_estimate() {
+        let samples = history(&[(10, 50), (0, 45)]);
+        assert_eq!(estimate_minutes_remaining(&samples, 45, false), None);
+    }
+
+    #[test]
+    fn samples_outside_the_trend_window_are_ignored() {
+        let samples = history(&[(10 * 60, 50), (0, 45)]);
+        assert_eq!(estimate_minutes_remaining(&samples, 45, false), None);
+    }
+
+    #[test]
+    fn an_estimate_past_two_days_is_noise() {
+        let samples = history(&[(60, 50), (0, 49)]);
+        assert_eq!(estimate_minutes_remaining(&samples, 49, false), None);
     }
 
     #[test]
@@ -2051,6 +2476,9 @@ mod tests {
                     device_name: id.into(),
                     percent: 80,
                     charging: false,
+                    dpi: None,
+                    polling_rate_hz: None,
+                    switch_mode: None,
                 })
                 .await
                 .unwrap();
@@ -2148,5 +2576,79 @@ mod tests {
         bridge.record_client_heartbeat().await;
 
         assert!(bridge.snapshot().await.client_connected);
+    }
+
+    #[tokio::test]
+    async fn the_mode_flips_to_live_when_the_panel_handshakes() {
+        let bridge = service(BridgeConfig::default());
+        assert_eq!(bridge.snapshot().await.device_mode, "onboard");
+
+        let monitored = bridge.clone();
+        monitored.start_mode_monitor();
+        bridge.record_client_heartbeat().await;
+        // The mode monitor ticks every second; give it a beat to spot the
+        // handshake and flip the mode.
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+
+        assert_eq!(bridge.snapshot().await.device_mode, "live");
+        assert!(bridge.snapshot().await.hybrid_mode);
+    }
+
+    #[test]
+    fn the_discovered_battery_id_becomes_the_panel_style_id() {
+        // The panel reports `<brand>:<model>`; discovery's descriptor tail
+        // (a LIGHTSPEED receiver) must canonicalize onto that id so the
+        // same mouse never appears as two rows.
+        assert_eq!(
+            canonical_battery_identity("Logitech:046d:c547", "PRO X SUPERLIGHT 2 SE"),
+            "Logitech:PRO X SUPERLIGHT 2 SE"
+        );
+        // Brands with no model name keep their discovered id.
+        assert_eq!(
+            canonical_battery_identity("Logitech:046d:c547", ""),
+            "Logitech:"
+        );
+    }
+
+    #[test]
+    fn discovered_mice_fill_the_gap_without_shadowing_profiled_devices() {
+        let detected = |device_id: &str, name: &str| drivers::DetectedMouse {
+            device_id: device_id.into(),
+            name: name.into(),
+        };
+        // No profiles: every discovered mouse is polled.
+        assert_eq!(
+            merge_detected_mice(
+                Vec::new(),
+                &[detected("Pulsar:0d1f0200", "Pulsar X2 CrazyLight")]
+            ),
+            vec![(
+                "Pulsar:0d1f0200".to_owned(),
+                "Pulsar X2 CrazyLight".to_owned()
+            )]
+        );
+        // A profile already names the brand: discovery adds nothing, so the
+        // same physical mouse is never reported under two ids.
+        assert_eq!(
+            merge_detected_mice(
+                vec![("Pulsar:X2 CrazyLight".to_owned(), "X2".to_owned())],
+                &[detected("Pulsar:0d1f0200", "Pulsar X2 CrazyLight")]
+            ),
+            vec![("Pulsar:X2 CrazyLight".to_owned(), "X2".to_owned())]
+        );
+        // Brand matching is case-insensitive; other brands still merge.
+        assert_eq!(
+            merge_detected_mice(
+                vec![("pulsar:X2".to_owned(), "X2".to_owned())],
+                &[
+                    detected("Pulsar:0d1f0200", "Pulsar X2 CrazyLight"),
+                    detected("Delux:M800", "Delux M800")
+                ]
+            ),
+            vec![
+                ("pulsar:X2".to_owned(), "X2".to_owned()),
+                ("Delux:M800".to_owned(), "Delux M800".to_owned())
+            ]
+        );
     }
 }

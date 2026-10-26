@@ -6,8 +6,33 @@ portable so additional desktop adapters do not require changes to the web app.
 
 The initial service provides:
 
-- a compact tray panel for status, startup, battery, and update controls;
+- a compact tray panel for status, startup, battery, and update controls,
+  with a device summary row set showing the mouse's current DPI, polling
+  rate, and switch mode as read from its onboard memory;
+- a live tray icon that shows the connected mouse's battery, drawn square at
+  the taskbar's real pixel size with either the native Segoe Fluent Icons
+  battery glyph (Segoe MDL2 Assets on Windows 10) or the percentage number in
+  bold text — a control-panel choice, since the Windows 11 taskbar only
+  renders square tray icons faithfully — tinted by charge state: green while
+  charging (the variant with the built-in bolt) or above half, amber through
+  the mid band, alert red at or below the low-battery threshold, gray when
+  the reading is stale, and a level glyph for every 10% — with a tooltip that
+  spells everything out — `Device — 87% · Charging · full in 45 m` —
+  including the estimated time remaining from the recent trend;
 - process-based detection for configured game executables;
+- startup discovery: Bridge scans the HID bus for mice whose brands it has
+  drivers for (the same vendor table the native-hid helper drives — Pulsar,
+  Logitech, Razer, Delux, VGN, and more), so the tray shows the battery from
+  the first second — no web panel connection and no saved profile required;
+- hybrid device mode (toggle in the panel): while the OpenMouse web app is
+  disconnected, Bridge drives the mouse itself in onboard memory mode — the
+  active profile's stored DPI, polling rate, and switch mode are pushed
+  natively (switch mode wherever a driver supports it, e.g. Logitech
+  LightForce), and the battery is read directly (including a native Pulsar
+  battery reader) — and the moment the web app connects, it takes the mouse
+  over live, with Bridge restoring the stored settings and reading the
+  battery again on disconnect; without a saved profile Bridge leaves the
+  mouse's own onboard memory untouched and just monitors it;
 - discovery of visible applications and the foreground application (on Linux, foreground detection needs X11; on Wayland every entry reports `foreground: false`);
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown, from
