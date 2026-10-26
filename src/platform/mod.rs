@@ -8,8 +8,8 @@ mod windows;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(target_os = "linux")]
-mod linux;
+#[cfg(any(target_os = "linux", test))]
+pub mod linux;
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod portable;

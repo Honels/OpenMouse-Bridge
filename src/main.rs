@@ -6,6 +6,8 @@
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod desktop;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod native_ui;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod overlay;
 
 use std::fs;
