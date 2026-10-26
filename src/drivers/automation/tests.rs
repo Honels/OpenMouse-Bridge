@@ -86,8 +86,11 @@ fn failed_partial_apply_is_restored_even_if_same_request_remains() {
     };
     let game = profile("a", Some(1600), Some(2000));
     assert!(automation.reconcile(Some(&game), &mut io).is_err());
+    let original_error = automation.apply_error.clone();
+    assert_eq!(automation.attempted.as_ref(), Some(&game));
     let _ = automation.reconcile(Some(&game), &mut io);
     let _ = automation.reconcile(Some(&game), &mut io);
+    assert_eq!(automation.apply_error, original_error);
     assert_eq!(
         io.calls,
         [
@@ -243,6 +246,7 @@ fn delayed_restoration_retains_all_64_baselines_and_refuses_new_capture() {
     let mut automation = NativeAutomation::default();
     let mut io = FakeIo::default();
     let now = Instant::now();
+    let desired = profile("Zaunkoenig:new", Some(1600), None);
     for index in 0..64 {
         automation
             .apply(
@@ -257,14 +261,11 @@ fn delayed_restoration_retains_all_64_baselines_and_refuses_new_capture() {
     assert_eq!(automation.pending_restores_for(None), 64);
     assert!(
         automation
-            .reconcile_at(
-                Some(&profile("Zaunkoenig:new", Some(1600), None)),
-                &mut io,
-                now + Duration::from_millis(999),
-            )
+            .reconcile_at(Some(&desired), &mut io, now + Duration::from_millis(999),)
             .is_err()
     );
     assert_eq!(io.calls.len(), calls);
+    assert!(automation.attempted.is_none());
     assert_eq!(automation.entries.len(), 64);
     assert!(
         automation
@@ -273,10 +274,115 @@ fn delayed_restoration_retains_all_64_baselines_and_refuses_new_capture() {
             .all(|entry| entry.baseline.dpi == 800)
     );
     automation
-        .reconcile_at(None, &mut io, now + Duration::from_secs(1))
+        .reconcile_at(Some(&desired), &mut io, now + Duration::from_secs(1))
         .unwrap();
-    assert_eq!(io.calls.len(), calls + 64);
+    assert_eq!(io.calls.len(), calls + 66);
+    assert_eq!(
+        io.calls.last().unwrap(),
+        "write:Zaunkoenig:new:Some(1600):None"
+    );
+    assert_eq!(automation.attempted.as_ref(), Some(&desired));
+    assert!(automation.apply_error.is_none());
+    automation
+        .reconcile_at(None, &mut io, now + Duration::from_secs(2))
+        .unwrap();
     assert!(automation.entries.is_empty());
+}
+
+#[test]
+fn delayed_same_device_restoration_retries_unchanged_desired_profile() {
+    let mut automation = NativeAutomation::default();
+    let mut io = FakeIo::default();
+    let now = Instant::now();
+    let desired = profile("a", Some(3200), None);
+    automation
+        .reconcile_at(Some(&profile("a", Some(1600), None)), &mut io, now)
+        .unwrap();
+    io.fail_writes = 1;
+    assert!(automation.reconcile_at(None, &mut io, now).is_err());
+    assert!(
+        automation
+            .reconcile_at(Some(&desired), &mut io, now + Duration::from_millis(999))
+            .is_err()
+    );
+    assert!(automation.attempted.is_none());
+    assert_eq!(io.calls.len(), 3);
+    automation
+        .reconcile_at(Some(&desired), &mut io, now + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        &io.calls[3..],
+        [
+            "write:a:Some(800):None",
+            "read:a",
+            "write:a:Some(3200):None"
+        ]
+    );
+    assert_eq!(automation.attempted.as_ref(), Some(&desired));
+    assert!(automation.apply_error.is_none());
+    automation
+        .reconcile_at(Some(&desired), &mut io, now + Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(io.calls.len(), 6);
+}
+
+#[test]
+fn returning_to_previous_profile_while_deferred_retries_after_restoration() {
+    let mut automation = NativeAutomation::default();
+    let mut io = FakeIo {
+        fail_writes: 1,
+        ..Default::default()
+    };
+    let now = Instant::now();
+    let original = profile("a", Some(1600), None);
+    assert!(
+        automation
+            .reconcile_at(Some(&original), &mut io, now)
+            .is_err()
+    );
+    io.fail_writes = 1;
+    assert!(
+        automation
+            .reconcile_at(Some(&profile("a", Some(3200), None)), &mut io, now)
+            .is_err()
+    );
+    assert_eq!(automation.attempted.as_ref(), Some(&original));
+    assert!(
+        automation
+            .reconcile_at(Some(&original), &mut io, now + Duration::from_millis(999))
+            .is_err()
+    );
+    automation
+        .reconcile_at(Some(&original), &mut io, now + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(io.calls.last().unwrap(), "write:a:Some(1600):None");
+    assert!(automation.apply_error.is_none());
+}
+
+#[test]
+fn restored_previous_device_profile_is_reapplied_after_blocked_switch() {
+    let mut automation = NativeAutomation::default();
+    let mut io = FakeIo::default();
+    let now = Instant::now();
+    let a = profile("a", Some(1600), None);
+    let b = profile("b", Some(3200), None);
+    automation.reconcile_at(Some(&b), &mut io, now).unwrap();
+    io.fail_writes = 1;
+    assert!(automation.reconcile_at(Some(&a), &mut io, now).is_err());
+    let waiting = now + Duration::from_millis(999);
+    assert!(automation.reconcile_at(Some(&b), &mut io, waiting).is_err());
+    assert!(automation.reconcile_at(Some(&a), &mut io, waiting).is_err());
+    assert_eq!(io.calls.last().unwrap(), "write:a:Some(1600):None");
+    assert!(automation.apply_error.is_none());
+    let calls = io.calls.len();
+    automation
+        .reconcile_at(Some(&a), &mut io, now + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(io.calls.len(), calls + 1);
+    assert_eq!(io.calls.last().unwrap(), "write:b:Some(800):None");
+    assert!(automation.entries.contains_key("a"));
+    assert_eq!(automation.attempted.as_ref(), Some(&a));
+    assert!(automation.apply_error.is_none());
 }
 
 #[test]
