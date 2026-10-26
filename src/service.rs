@@ -1287,7 +1287,7 @@ impl BridgeService {
                 Err(error) => {
                     let message = format!("{error:#}");
                     if message.contains("unsupported acknowledged native automation") {
-                        apply_legacy_once(desired.as_ref()).map_or(Some(message), |legacy| legacy)
+                        apply_legacy_once(desired.as_ref()).unwrap_or(Some(message))
                     } else {
                         *legacy_applied() = None;
                         Some(message)
