@@ -493,6 +493,7 @@ impl HidSession {
                 .with_recovery(&device, |session| {
                     session.receive_feature_report(&device, report_id)
                 })
+                .inspect(|_| self.learn_control_path(&device))
                 .map(|data| Reply {
                     data: Some(data),
                     ..Reply::ok(id)
@@ -590,8 +591,34 @@ impl HidSession {
             }
         }
 
+        // Present paths per product, to hide collections the control panel
+        // never used once the one it does use is known.
+        let mut present_paths = HashMap::<(u16, u16), HashSet<String>>::new();
+        for infos in by_device.values() {
+            for info in infos {
+                present_paths
+                    .entry((info.vendor_id(), info.product_id()))
+                    .or_default()
+                    .insert(info.path().to_string_lossy().into_owned());
+            }
+        }
+        let visible: HashMap<(u16, u16), HashSet<String>> = present_paths
+            .iter()
+            .filter_map(|(&(vendor, product), present)| {
+                visible_paths(vendor, product, present).map(|paths| ((vendor, product), paths))
+            })
+            .collect();
+
         let mut summaries = Vec::with_capacity(by_device.len());
         for (device_id, infos) in by_device {
+            if let Some(first) = infos.first()
+                && let Some(paths) = visible.get(&(first.vendor_id(), first.product_id()))
+                && !infos
+                    .iter()
+                    .any(|info| paths.contains(info.path().to_string_lossy().as_ref()))
+            {
+                continue;
+            }
             let key = if let Some(key) = self.device_keys.get(&device_id) {
                 key.clone()
             } else {
@@ -637,6 +664,21 @@ impl HidSession {
         }
         summaries.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(summaries)
+    }
+
+    /// Remembers the single path of a device that answered a feature report,
+    /// so its sibling collections can be hidden from later lists.
+    fn learn_control_path(&self, key: &str) {
+        let Some(candidate) = self.candidates.get(key) else {
+            return;
+        };
+        if let [only] = candidate.paths.as_slice() {
+            remember_control_path(
+                candidate.summary.vendor_id,
+                candidate.summary.product_id,
+                &only.path,
+            );
+        }
     }
 
     fn reconcile_inventory(&mut self, present: &HashSet<Vec<u8>>) -> Result<(), String> {
@@ -1101,6 +1143,67 @@ fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
     data.get(1..size.min(data.len()))
         .unwrap_or_default()
         .to_vec()
+}
+
+/// HID paths that have answered a feature-report read, per `vvvv:pppp`.
+/// A mouse without a serial is listed as one card per collection; once the
+/// control panel has talked to one of them, the others are hidden from the
+/// list while a remembered path is present. Persisted beside `config.json`.
+type LearnedPaths = HashMap<String, HashSet<String>>;
+
+fn learned_file() -> Option<std::path::PathBuf> {
+    crate::config::config_path()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("hid-control-paths.json")))
+}
+
+fn learned_paths() -> std::sync::MutexGuard<'static, LearnedPaths> {
+    static LEARNED: OnceLock<Mutex<LearnedPaths>> = OnceLock::new();
+    LEARNED
+        .get_or_init(|| {
+            let loaded = learned_file()
+                .and_then(|file| std::fs::read(file).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            Mutex::new(loaded)
+        })
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn product_key(vendor_id: u16, product_id: u16) -> String {
+    format!("{vendor_id:04x}:{product_id:04x}")
+}
+
+fn remember_control_path(vendor_id: u16, product_id: u16, path: &CString) {
+    let path = path.to_string_lossy().into_owned();
+    let mut learned = learned_paths();
+    if !learned
+        .entry(product_key(vendor_id, product_id))
+        .or_default()
+        .insert(path)
+    {
+        return;
+    }
+    if let (Some(file), Ok(json)) = (learned_file(), serde_json::to_vec_pretty(&*learned))
+        && let Err(error) = std::fs::write(&file, json)
+    {
+        tracing::warn!(%error, "could not save the learned HID control paths");
+    }
+}
+
+/// Paths of a product to show, or `None` to show every path: either nothing
+/// was learned yet, or no remembered path is present (another USB port, a new
+/// receiver), in which case the full list returns so it can be learned again.
+fn visible_paths(
+    vendor_id: u16,
+    product_id: u16,
+    present: &HashSet<String>,
+) -> Option<HashSet<String>> {
+    let learned = learned_paths();
+    let known = learned.get(&product_key(vendor_id, product_id))?;
+    let visible: HashSet<String> = known.intersection(present).cloned().collect();
+    (!visible.is_empty()).then_some(visible)
 }
 
 fn grouped_device_key(

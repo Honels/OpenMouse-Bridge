@@ -1278,10 +1278,23 @@ impl BridgeService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let result = crate::drivers::reconcile_automatic(&mut automation, desired.as_ref());
-            (
-                result.err().map(|error| format!("{error:#}")),
-                automation.pending_restores_for(desired.as_ref()),
-            )
+            let pending = automation.pending_restores_for(desired.as_ref());
+            let error = match result {
+                Ok(()) => {
+                    *legacy_applied() = None;
+                    None
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if message.contains("unsupported acknowledged native automation") {
+                        apply_legacy_once(desired.as_ref()).map_or(Some(message), |legacy| legacy)
+                    } else {
+                        *legacy_applied() = None;
+                        Some(message)
+                    }
+                }
+            };
+            (error, pending)
         })
         .await
     }
@@ -1538,6 +1551,43 @@ async fn resume_onboard(service: &BridgeService) {
         });
     }
     tokio::spawn(poll_batteries_once(service.clone()));
+}
+
+/// The profile last written by the beta.18-style fallback, so the 3-second
+/// monitor tick writes the mouse once per switch instead of on every tick.
+fn legacy_applied() -> std::sync::MutexGuard<'static, Option<ApplicationProfile>> {
+    static LAST: std::sync::Mutex<Option<ApplicationProfile>> = std::sync::Mutex::new(None);
+    LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Brands without acknowledged automation (everything except Zaunkoenig in
+/// beta.19) fall back to the direct profile write beta.18 used on every game
+/// switch. Returns `None` when the automation error should be reported as is,
+/// or `Some(result)` with the fallback's own outcome.
+fn apply_legacy_once(desired: Option<&ApplicationProfile>) -> Option<Option<String>> {
+    let profile = desired?;
+    // A connected control panel owns the mouse; let it apply the profile and
+    // write again once it disconnects.
+    if crate::hid::client_session_active() {
+        *legacy_applied() = None;
+        return Some(None);
+    }
+    if legacy_applied().as_ref() == Some(profile) {
+        return Some(None);
+    }
+    match crate::drivers::apply_profile(profile) {
+        Ok(true) => {
+            tracing::info!(
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "Applied the mouse profile natively (fallback)"
+            );
+            *legacy_applied() = Some(profile.clone());
+            Some(None)
+        }
+        Ok(false) => None,
+        Err(error) => Some(Some(format!("{error:#}"))),
+    }
 }
 
 fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
