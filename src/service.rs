@@ -1280,6 +1280,9 @@ impl BridgeService {
             let result = crate::drivers::reconcile_automatic(&mut automation, desired.as_ref());
             let pending = automation.pending_restores_for(desired.as_ref());
             let error = match result {
+                // No profile wants the mouse any more: put back what the
+                // fallback found before its first write.
+                Ok(()) if desired.is_none() => restore_legacy_baseline(),
                 Ok(()) => {
                     *legacy_applied() = None;
                     None
@@ -1560,6 +1563,75 @@ fn legacy_applied() -> std::sync::MutexGuard<'static, Option<ApplicationProfile>
     LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The mouse's own DPI/polling rate read before the fallback first wrote a
+/// profile, as a profile that writes them back once no profile applies.
+fn legacy_baseline() -> std::sync::MutexGuard<'static, Option<ApplicationProfile>> {
+    static BASELINE: std::sync::Mutex<Option<ApplicationProfile>> = std::sync::Mutex::new(None);
+    BASELINE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn capture_legacy_baseline(profile: &ApplicationProfile) {
+    // Only the first write away from the mouse's own settings is a baseline;
+    // a switch from one game profile to another keeps the original.
+    if legacy_applied().is_some() || legacy_baseline().is_some() {
+        return;
+    }
+    match crate::drivers::read_status(&profile.device.id) {
+        Ok(Some(status)) => {
+            let mut baseline = profile.clone();
+            baseline.settings = config::ProfileSettings {
+                dpi: profile.settings.dpi.and(status.dpi),
+                polling_rate_hz: profile.settings.polling_rate_hz.and(status.polling_rate_hz),
+                snapshot: None,
+            };
+            tracing::info!(
+                device = %profile.device.name,
+                dpi = ?baseline.settings.dpi,
+                polling_rate_hz = ?baseline.settings.polling_rate_hz,
+                "Captured the mouse's settings to restore after the game"
+            );
+            *legacy_baseline() = Some(baseline);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not read the mouse's settings before the game profile");
+        }
+    }
+}
+
+fn restore_legacy_baseline() -> Option<String> {
+    if legacy_applied().is_none() {
+        return None;
+    }
+    if crate::hid::client_session_active() {
+        // The panel owns the mouse now and applies its own settings.
+        *legacy_applied() = None;
+        *legacy_baseline() = None;
+        return None;
+    }
+    let Some(baseline) = legacy_baseline().clone() else {
+        *legacy_applied() = None;
+        return None;
+    };
+    match crate::drivers::apply_profile(&baseline) {
+        Ok(_) => {
+            tracing::info!(
+                device = %baseline.device.name,
+                dpi = ?baseline.settings.dpi,
+                polling_rate_hz = ?baseline.settings.polling_rate_hz,
+                "Restored the mouse's settings after the game"
+            );
+            *legacy_applied() = None;
+            *legacy_baseline() = None;
+            None
+        }
+        // Kept so the next monitor tick tries again.
+        Err(error) => Some(format!("{error:#}")),
+    }
+}
+
 /// Brands without acknowledged automation (everything except Zaunkoenig in
 /// beta.19) fall back to the direct profile write beta.18 used on every game
 /// switch. Returns `None` when the automation error should be reported as is,
@@ -1575,6 +1647,7 @@ fn apply_legacy_once(desired: Option<&ApplicationProfile>) -> Option<Option<Stri
     if legacy_applied().as_ref() == Some(profile) {
         return Some(None);
     }
+    capture_legacy_baseline(profile);
     match crate::drivers::apply_profile(profile) {
         Ok(true) => {
             tracing::info!(
