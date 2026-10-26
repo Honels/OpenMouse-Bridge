@@ -448,7 +448,10 @@ main() {
             write_udev_rule "$tmp/69-openmouse-bridge.rules"
             $sudo cp "$tmp/69-openmouse-bridge.rules" "$rule"
             # /dev/uinput only exists once the uinput module is loaded.
-            echo uinput | $sudo tee /etc/modules-load.d/openmouse-bridge.conf >/dev/null
+            # Best effort: button assignments need it, the rest of Bridge does not.
+            if ! { $sudo mkdir -p /etc/modules-load.d && echo uinput | $sudo tee /etc/modules-load.d/openmouse-bridge.conf >/dev/null; }; then
+                warn "could not configure uinput to load at boot; button assignments need /dev/uinput"
+            fi
             $sudo modprobe uinput 2>/dev/null || true
             $sudo udevadm control --reload-rules 2>/dev/null || true
             $sudo udevadm trigger --subsystem-match=hidraw --action=change 2>/dev/null || true

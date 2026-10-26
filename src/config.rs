@@ -201,8 +201,8 @@ impl BridgeConfig {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
         self.notification_volume = self.notification_volume.min(100);
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
-        normalize_games(&mut self.games);
-        normalize_games(&mut self.custom_games);
+        normalize_games(&mut self.games, &CATALOG_LIMITS);
+        normalize_games(&mut self.custom_games, &CUSTOM_GAME_LIMITS);
         for profile in &mut self.profiles {
             profile.application.name = profile.application.name.trim().to_owned();
             profile.application.executable = profile.application.executable.trim().to_owned();
@@ -269,24 +269,47 @@ const MAX_NAME_CHARS: usize = 80;
 const MAX_EXECUTABLES: usize = 20;
 const MAX_EXECUTABLE_CHARS: usize = 260;
 
-fn normalize_games(games: &mut Vec<GameConfig>) {
+struct GameLimits {
+    games: usize,
+    name_chars: usize,
+    executables: usize,
+    executable_chars: usize,
+}
+
+/// What a user may add by hand.
+const CUSTOM_GAME_LIMITS: GameLimits = GameLimits {
+    games: MAX_GAMES,
+    name_chars: MAX_NAME_CHARS,
+    executables: MAX_EXECUTABLES,
+    executable_chars: MAX_EXECUTABLE_CHARS,
+};
+
+/// The catalog is already bounded when it is fetched; these match that parser.
+const CATALOG_LIMITS: GameLimits = GameLimits {
+    games: crate::games::MAX_CATALOG_GAMES,
+    name_chars: crate::games::MAX_CATALOG_STRING,
+    executables: crate::games::MAX_EXECUTABLES,
+    executable_chars: crate::games::MAX_CATALOG_STRING,
+};
+
+fn normalize_games(games: &mut Vec<GameConfig>, limits: &GameLimits) {
     for game in games.iter_mut() {
-        game.name = game.name.trim().chars().take(MAX_NAME_CHARS).collect();
+        game.name = game.name.trim().chars().take(limits.name_chars).collect();
         game.executables = game
             .executables
             .iter()
             .map(|entry| entry.trim().to_ascii_lowercase())
-            .filter(|entry| !entry.is_empty() && entry.chars().count() <= MAX_EXECUTABLE_CHARS)
+            .filter(|entry| !entry.is_empty() && entry.chars().count() <= limits.executable_chars)
             .collect();
         game.executables.sort();
         game.executables.dedup();
-        game.executables.truncate(MAX_EXECUTABLES);
+        game.executables.truncate(limits.executables);
     }
     games.retain(|game| !game.name.is_empty() && !game.executables.is_empty());
     // Sorted by the folded name, so names that differ only in case sit side by side for the dedup.
     games.sort_by_key(|game| game.name.to_ascii_lowercase());
     games.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
-    games.truncate(MAX_GAMES);
+    games.truncate(limits.games);
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -423,7 +446,7 @@ mod tests {
         };
         // Sorted by plain bytes these would be Alpha, Beta, alpha: the two Alphas apart.
         let mut games = vec![game("alpha"), game("Beta"), game("Alpha")];
-        normalize_games(&mut games);
+        normalize_games(&mut games, &CUSTOM_GAME_LIMITS);
         assert_eq!(games.len(), 2);
     }
 
@@ -438,7 +461,7 @@ mod tests {
                 .collect()
         };
         let mut games = many(MAX_GAMES + 50);
-        normalize_games(&mut games);
+        normalize_games(&mut games, &CUSTOM_GAME_LIMITS);
         assert_eq!(games.len(), MAX_GAMES);
 
         let mut one = vec![GameConfig {
@@ -448,7 +471,7 @@ mod tests {
                 .chain([format!("{}.exe", "x".repeat(300))])
                 .collect(),
         }];
-        normalize_games(&mut one);
+        normalize_games(&mut one, &CUSTOM_GAME_LIMITS);
         assert_eq!(one[0].name.chars().count(), MAX_NAME_CHARS);
         assert_eq!(one[0].executables.len(), MAX_EXECUTABLES);
         assert!(
@@ -457,6 +480,24 @@ mod tests {
                 .iter()
                 .all(|entry| entry.chars().count() <= MAX_EXECUTABLE_CHARS)
         );
+    }
+
+    #[test]
+    fn the_catalog_is_not_held_to_the_custom_game_limits() {
+        let config = BridgeConfig {
+            games: (0..MAX_GAMES + 50)
+                .map(|i| GameConfig {
+                    name: format!("game {i:04}"),
+                    executables: (0..MAX_EXECUTABLES + 5)
+                        .map(|e| format!("g{i}-{e}.exe"))
+                        .collect(),
+                })
+                .collect(),
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        assert_eq!(config.games.len(), MAX_GAMES + 50);
+        assert_eq!(config.games[0].executables.len(), MAX_EXECUTABLES + 5);
     }
 
     #[test]

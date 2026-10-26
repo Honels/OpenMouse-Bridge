@@ -13,9 +13,9 @@ pub const GAMES_CDN_URL: &str =
 const GAMES_URL_ENV: &str = "OPENMOUSE_BRIDGE_GAMES_URL";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CATALOG_GAMES: usize = 10_000;
-const MAX_EXECUTABLES: usize = 32;
-const MAX_CATALOG_STRING: usize = 256;
+pub(crate) const MAX_CATALOG_GAMES: usize = 10_000;
+pub(crate) const MAX_EXECUTABLES: usize = 32;
+pub(crate) const MAX_CATALOG_STRING: usize = 256;
 
 #[derive(Deserialize)]
 struct CatalogResponse {

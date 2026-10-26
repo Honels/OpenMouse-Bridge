@@ -94,7 +94,25 @@ async function main(input) {
     process.exit(EXIT_NO_DRIVER);
   }
 
+  // Listening from the start: Bridge may close stdin while discovery is still
+  // probing, and an `end` emitted with no listener is not emitted again.
+  let stopRequested = false;
+  let stop = () => {
+    stopRequested = true;
+  };
+  const onStop = () => stop();
+  process.stdin.on("end", onStop);
+  process.stdin.on("close", onStop);
+  process.on("SIGTERM", onStop);
+  process.on("SIGINT", onStop);
+
   const { client, status } = await findClient(entry, typeof input.device === "string" ? input.device.trim() : "");
+  if (stopRequested || process.stdin.readableEnded) {
+    // Nothing has been changed on the mouse yet.
+    await client.close().catch(() => undefined);
+    emit({ event: "stopped" });
+    process.exit(EXIT_OK);
+  }
   const priorMode = status?.deviceMode ?? "Unknown";
   // The default profile only listens to a mouse already on Host; it never
   // switches one over, so a mouse on an onboard profile is left alone.
@@ -120,11 +138,7 @@ async function main(input) {
   }
 
   // Event handlers pass their own arguments (a signal name), which are not an exit code.
-  const stop = () => void shutdown();
-  process.stdin.on("end", stop);
-  process.stdin.on("close", stop);
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  stop = () => void shutdown();
 
   try {
     // The events only flow while the mouse runs from software; an unknown mode
@@ -136,6 +150,11 @@ async function main(input) {
     }
     client.onButtonChange((mask) => emit({ event: "buttons", mask }));
     const buttons = await withTimeout(client.startButtonListener(), STEP_TIMEOUT_MS, "startButtonListener");
+    // A stop that came in while switching modes: put the mouse back now.
+    if (stopRequested || process.stdin.readableEnded) {
+      await shutdown();
+      return;
+    }
     emit({ event: "ready", priorMode, buttons });
   } catch (error) {
     emit({ event: "error", message: error.message });

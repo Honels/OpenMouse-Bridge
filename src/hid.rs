@@ -1091,13 +1091,16 @@ fn grouped_device_key(
     path: &[u8],
     serial: Option<&str>,
 ) -> Vec<u8> {
-    let serial = serial.unwrap_or_default().as_bytes();
-    let mut key = Vec::with_capacity(12 + path.len() + serial.len());
+    // A serial is a verified physical identity, so every collection of that
+    // device is one candidate. Without one, collections stay apart by path.
+    let serial = serial.filter(|serial| !serial.is_empty());
+    let identity = serial.map_or(path, str::as_bytes);
+    let mut key = Vec::with_capacity(13 + identity.len());
     key.extend_from_slice(&vendor_id.to_le_bytes());
     key.extend_from_slice(&product_id.to_le_bytes());
-    key.extend_from_slice(&(path.len() as u64).to_le_bytes());
-    key.extend_from_slice(path);
-    key.extend_from_slice(serial);
+    key.push(u8::from(serial.is_some()));
+    key.extend_from_slice(&(identity.len() as u64).to_le_bytes());
+    key.extend_from_slice(identity);
     key
 }
 
@@ -1627,6 +1630,28 @@ mod tests {
         assert_ne!(
             grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
             grouped_device_key(0x1532, 0xc54d, b"opaque-A", None)
+        );
+        assert_ne!(
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", Some("")),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-B", Some("")),
+            "an empty serial is no identity"
+        );
+    }
+
+    #[test]
+    fn collections_of_one_serial_bearing_device_group_together() {
+        assert_eq!(
+            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-123")),
+            grouped_device_key(0x1532, 0x00b0, b"col02", Some("receiver-123"))
+        );
+        assert_ne!(
+            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-123")),
+            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-456"))
+        );
+        // A serial that happens to equal another device's path is still a different identity.
+        assert_ne!(
+            grouped_device_key(0x1532, 0x00b0, b"same", Some("same")),
+            grouped_device_key(0x1532, 0x00b0, b"same", None)
         );
     }
 
