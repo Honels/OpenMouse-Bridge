@@ -37,6 +37,11 @@ struct ApplyRequest<'a> {
     dpi: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pollingRateHz")]
     polling_rate_hz: Option<u32>,
+    /// The profile's opaque panel settings (`ProfileSettings.snapshot`,
+    /// e.g. `{"lightforceSwitchMode":"Optical"}`). The helper applies the
+    /// fields its driver supports and skips the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -52,13 +57,49 @@ struct StatusRequest<'a> {
 struct StatusReply {
     battery_percent: Option<f64>,
     battery_state: Option<String>,
+    /// The driver's own model name (`MouseStatus.name`), when the driver
+    /// reports one — better than the receiver-level name discovery gets from
+    /// the HID descriptor.
+    device_name: Option<String>,
+    /// The settings currently in the device's onboard memory, when the
+    /// driver can read them. `dpi` is a number or a per-stage list in
+    /// `MouseStatus`; anything else parses as `None`.
+    dpi: Option<serde_json::Value>,
+    polling_rate_hz: Option<f64>,
+    switch_mode: Option<String>,
 }
 
 /// A battery level read from the mouse over native HID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeBattery {
     pub percent: u8,
     pub charging: bool,
+    /// The model name the driver itself reported, when it did.
+    pub reported_name: Option<String>,
+}
+
+/// Everything the mouse reports about its own onboard-memory state: the
+/// battery plus the settings currently in effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeStatus {
+    pub battery: NativeBattery,
+    pub dpi: Option<u32>,
+    pub polling_rate_hz: Option<u32>,
+    /// Logitech's LightForce switch mode; `None` for brands without one.
+    pub switch_mode: Option<String>,
+}
+
+/// `MouseStatus.dpi` is either one number or a per-stage list; the stages
+/// have no reliable "active" marker, so a list collapses to its first
+/// stage — the one most drivers treat as the default.
+fn coerce_dpi(value: Option<&serde_json::Value>) -> Option<u32> {
+    match value? {
+        serde_json::Value::Number(number) => number.as_u64().map(|dpi| dpi as u32),
+        serde_json::Value::Array(stages) => stages
+            .iter()
+            .find_map(|stage| stage.as_u64().map(|dpi| dpi as u32)),
+        _ => None,
+    }
 }
 
 /// Pushes a profile's DPI/polling rate to the mouse via the Node helper.
@@ -68,10 +109,11 @@ pub struct NativeBattery {
 /// apply itself failed (including the helper or Node.js being unavailable).
 pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
     let brand = profile.device.id.split(':').next().unwrap_or_default();
-    apply_settings(
+    apply_settings_with_snapshot(
         brand,
         profile.settings.dpi,
         profile.settings.polling_rate_hz,
+        profile.settings.snapshot.as_ref(),
     )
 }
 
@@ -79,18 +121,28 @@ pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
 /// the exact helper path used by automatic profiles, so native device control
 /// and profile switching cannot drift into separate protocol implementations.
 pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
+    apply_settings_with_snapshot(brand, dpi, polling_rate_hz, None)
+}
+
+fn apply_settings_with_snapshot(
+    brand: &str,
+    dpi: Option<u32>,
+    polling_rate_hz: Option<u32>,
+    settings: Option<&serde_json::Value>,
+) -> Result<bool> {
     let request = ApplyRequest {
         brand,
         dpi,
         polling_rate_hz,
+        settings,
     };
     Ok(run_helper(&request)?.is_some())
 }
 
-/// Reads the battery of a `brand` mouse via the Node helper. `Ok(None)` means
+/// Reads a `brand` mouse's status via the Node helper. `Ok(None)` means
 /// the helper has no driver for the brand or the mouse reports no battery
 /// (a wired mouse); `Err` means a driver exists but no mouse answered.
-pub fn read_battery(brand: &str) -> Result<Option<NativeBattery>> {
+pub fn read_status(brand: &str) -> Result<Option<NativeStatus>> {
     let request = StatusRequest {
         brand,
         action: "status",
@@ -100,10 +152,22 @@ pub fn read_battery(brand: &str) -> Result<Option<NativeBattery>> {
     };
     let reply: StatusReply = serde_json::from_slice(&stdout)
         .context("the native-hid helper returned an unreadable status")?;
-    Ok(parse_battery(reply))
+    Ok(parse_status(reply))
 }
 
-fn parse_battery(reply: StatusReply) -> Option<NativeBattery> {
+fn parse_status(reply: StatusReply) -> Option<NativeStatus> {
+    let battery = parse_battery(&reply)?;
+    Some(NativeStatus {
+        battery,
+        dpi: coerce_dpi(reply.dpi.as_ref()),
+        polling_rate_hz: reply
+            .polling_rate_hz
+            .and_then(|rate| u32::try_from(rate.round() as i64).ok()),
+        switch_mode: reply.switch_mode.filter(|mode| !mode.trim().is_empty()),
+    })
+}
+
+fn parse_battery(reply: &StatusReply) -> Option<NativeBattery> {
     let percent = reply.battery_percent?;
     if !percent.is_finite() {
         return None;
@@ -112,7 +176,12 @@ fn parse_battery(reply: StatusReply) -> Option<NativeBattery> {
         percent: percent.round().clamp(0.0, 100.0) as u8,
         charging: reply
             .battery_state
+            .as_ref()
             .is_some_and(|state| state.starts_with("Charging")),
+        reported_name: reply
+            .device_name
+            .clone()
+            .filter(|name| !name.trim().is_empty()),
     })
 }
 
@@ -362,29 +431,105 @@ mod tests {
         StatusReply {
             battery_percent: percent,
             battery_state: state.map(str::to_owned),
+            device_name: None,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
+        }
+    }
+
+    fn named_reply(name: &str) -> StatusReply {
+        StatusReply {
+            battery_percent: Some(41.0),
+            battery_state: Some("Discharging".into()),
+            device_name: Some(name.to_owned()),
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
         }
     }
 
     #[test]
     fn parses_battery_from_status() {
         assert_eq!(
-            parse_battery(reply(Some(41.0), Some("Discharging"))),
-            Some(NativeBattery {
-                percent: 41,
-                charging: false
+            parse_status(reply(Some(41.0), Some("Discharging"))),
+            Some(NativeStatus {
+                battery: NativeBattery {
+                    percent: 41,
+                    charging: false,
+                    reported_name: None,
+                },
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
             })
         );
         assert_eq!(
-            parse_battery(reply(Some(87.6), Some("Charging slowly"))),
-            Some(NativeBattery {
-                percent: 88,
-                charging: true
+            parse_status(reply(Some(87.6), Some("Charging slowly"))),
+            Some(NativeStatus {
+                battery: NativeBattery {
+                    percent: 88,
+                    charging: true,
+                    reported_name: None,
+                },
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
             })
         );
-        assert_eq!(parse_battery(reply(None, Some("Unknown"))), None);
+        assert_eq!(parse_status(reply(None, Some("Unknown"))), None);
         assert_eq!(
-            parse_battery(reply(Some(140.0), None)).map(|battery| battery.percent),
+            parse_status(reply(Some(140.0), None)).map(|status| status.battery.percent),
             Some(100)
         );
+        // The driver's model name rides along for better tray labels.
+        assert_eq!(
+            parse_status(named_reply("G Pro X Superlight 2")),
+            Some(NativeStatus {
+                battery: NativeBattery {
+                    percent: 41,
+                    charging: false,
+                    reported_name: Some("G Pro X Superlight 2".into()),
+                },
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+            })
+        );
+        // A blank name is treated as no name.
+        assert_eq!(
+            parse_status(named_reply("   ")).and_then(|status| status.battery.reported_name),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_the_onboard_settings_from_status() {
+        let mut logitech = reply(Some(81.0), Some("Discharging"));
+        logitech.device_name = Some("G Pro X Superlight 2".into());
+        logitech.dpi = Some(serde_json::json!(800));
+        logitech.polling_rate_hz = Some(1000.0);
+        logitech.switch_mode = Some("Optical".into());
+        assert_eq!(
+            parse_status(logitech),
+            Some(NativeStatus {
+                battery: NativeBattery {
+                    percent: 81,
+                    charging: false,
+                    reported_name: Some("G Pro X Superlight 2".into()),
+                },
+                dpi: Some(800),
+                polling_rate_hz: Some(1000),
+                switch_mode: Some("Optical".into()),
+            })
+        );
+        // Drivers that report a stage list collapse to the first stage, and
+        // blank switch modes read as none.
+        let mut staged = reply(Some(81.0), None);
+        staged.dpi = Some(serde_json::json!([400, 800, 1600]));
+        staged.switch_mode = Some("  ".into());
+        let status = parse_status(staged).expect("staged status parses");
+        assert_eq!(status.dpi, Some(400));
+        assert_eq!(status.switch_mode, None);
     }
 }

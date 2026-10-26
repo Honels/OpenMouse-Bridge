@@ -28,6 +28,17 @@ pub struct BridgeConfig {
     pub notification_sound: bool,
     #[serde(default = "default_notification_volume")]
     pub notification_volume: u8,
+    /// What the tray battery icon shows: `"glyph"` (the native battery icon)
+    /// or `"percentage"` (just the number). Other values read as `"glyph"`.
+    #[serde(default = "default_tray_battery_style")]
+    pub tray_battery_style: String,
+    /// Hybrid device mode: while the OpenMouse web panel is disconnected,
+    /// Bridge drives the mouse itself — the active profile's stored settings
+    /// (DPI, polling rate, switch mode) go to the onboard memory and the
+    /// battery is read natively — and hands the mouse over to the panel the
+    /// moment it connects, applying the stored settings again on disconnect.
+    #[serde(default = "enabled_by_default")]
+    pub hybrid_mode: bool,
     #[serde(default)]
     pub games: Vec<GameConfig>,
     /// Games the user added by hand. Kept apart from `games` because the
@@ -184,6 +195,8 @@ impl Default for BridgeConfig {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
+            tray_battery_style: default_tray_battery_style(),
+            hybrid_mode: true,
             games: Vec::new(),
             custom_games: Vec::new(),
             local_applications: Vec::new(),
@@ -201,6 +214,13 @@ impl BridgeConfig {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
         self.notification_volume = self.notification_volume.min(100);
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
+        // Only the two known tray styles are honored; anything else (a
+        // hand-edited config, an older panel) reads as the default glyph.
+        self.tray_battery_style = match self.tray_battery_style.trim().to_ascii_lowercase().as_str()
+        {
+            "percentage" => "percentage".to_owned(),
+            _ => "glyph".to_owned(),
+        };
         normalize_games(&mut self.games, &CATALOG_LIMITS);
         normalize_games(&mut self.custom_games, &CUSTOM_GAME_LIMITS);
         for profile in &mut self.profiles {
@@ -423,6 +443,10 @@ const fn default_notification_volume() -> u8 {
     DEFAULT_NOTIFICATION_VOLUME
 }
 
+fn default_tray_battery_style() -> String {
+    "glyph".to_owned()
+}
+
 fn default_origins() -> Vec<String> {
     vec![
         "https://control.openmouse.app".to_owned(),
@@ -581,6 +605,8 @@ mod tests {
             notification_sound: true,
             notification_volume: 180,
             custom_games: Vec::new(),
+            tray_battery_style: " percentage ".to_owned(),
+            hybrid_mode: true,
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
@@ -592,6 +618,7 @@ mod tests {
         assert_eq!(config.battery_threshold_percent, 100);
         assert_eq!(config.alert_cooldown_minutes, 1);
         assert_eq!(config.notification_volume, 100);
+        assert_eq!(config.tray_battery_style, "percentage");
         let valorant = config
             .games
             .iter()
@@ -628,6 +655,15 @@ mod tests {
             .collect();
         assert_eq!(names, ["Valorant", "My Game"]);
         assert_eq!(config.custom_games[0].executables, ["mygame.exe"]);
+    }
+
+    #[test]
+    fn hybrid_mode_defaults_to_on_and_normalizes_to_a_bool() {
+        let config: BridgeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert!(config.hybrid_mode);
+        let config: BridgeConfig =
+            serde_json::from_str(r#"{"hybridMode": false}"#).expect("off config parses");
+        assert!(!config.hybrid_mode);
     }
 
     #[test]

@@ -15,11 +15,12 @@ use std::{
 use crate::overlay::Overlay;
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{
-    self, Align, Button, Frame, Layout, Pos2, RichText, Sense, Stroke, Vec2, ViewportCommand,
+    self, Align, Button, Color32, Frame, Layout, Pos2, RichText, Sense, Stroke, Vec2,
+    ViewportCommand,
 };
 use openmouse_bridge::{
     BRIDGE_PORT, api, config, platform,
-    service::{BridgeService, BridgeSnapshot, Notice},
+    service::{BridgeService, BridgeSnapshot, DeviceBattery, Notice},
     updater::{self, UpdateInfo},
 };
 #[cfg(target_os = "windows")]
@@ -307,6 +308,8 @@ enum BridgeCommand {
     SetNotificationSound(bool),
     SetNotificationVolume(u8),
     SetAutomaticUpdates(bool),
+    SetHybridMode(bool),
+    SetTrayBatteryStyle(platform::TrayBatteryStyle),
     CheckForUpdates,
     InstallUpdate(UpdateInfo),
     AcknowledgeTrayHint,
@@ -347,15 +350,47 @@ fn update_is_notice(state: &UpdateState) -> bool {
     )
 }
 
-fn panel_height(view: View, details: bool, saved_values: bool, notice: bool) -> f32 {
+/// Height added to the Home view while a device-summary row is showing
+/// (the mouse's live onboard-memory settings under the profile panel).
+const DEVICE_SUMMARY_HEIGHT: f32 = 22.0;
+
+fn panel_height(
+    view: View,
+    details: bool,
+    saved_values: bool,
+    notice: bool,
+    device_summary: bool,
+) -> f32 {
     if view == View::Settings {
         return 420.0;
     }
     if details {
         return 340.0;
     }
-    (WINDOW_HEIGHT + if saved_values { 18.0 } else { 0.0 } + if notice { 40.0 } else { 0.0 })
-        .min(340.0)
+    let base =
+        (WINDOW_HEIGHT + if saved_values { 18.0 } else { 0.0 } + if notice { 40.0 } else { 0.0 })
+            .min(340.0);
+    base + if device_summary {
+        DEVICE_SUMMARY_HEIGHT
+    } else {
+        0.0
+    }
+}
+
+/// The battery entry whose onboard-memory settings the Home view renders
+/// under the profile panel — the freshest non-stale one carrying any. Both
+/// the renderer and the window sizing go through this so they stay in step.
+fn device_summary_battery(snapshot: Option<&BridgeSnapshot>) -> Option<&DeviceBattery> {
+    let snapshot = snapshot?;
+    snapshot
+        .batteries
+        .iter()
+        .find(|battery| !battery.stale)
+        .filter(|battery| {
+            battery.dpi.is_some()
+                || battery.polling_rate_hz.is_some()
+                || battery.switch_mode.is_some()
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -364,6 +399,85 @@ enum TrayAction {
     ToggleWindow { rect: TrayRect },
     Restart,
     Exit,
+}
+
+/// The battery display currently swapped into the tray icon: `None` keeps
+/// the static OpenMouse logo. Every field here feeds the drawing or the
+/// tooltip, so comparing against the next snapshot redraws exactly when
+/// the level, charge state, estimate, or size changed — and stops the
+/// per-second updates from churning the icon when nothing did.
+#[derive(Clone, PartialEq, Eq)]
+struct TrayBattery {
+    device_name: String,
+    percent: u8,
+    charging: bool,
+    stale: bool,
+    /// The Segoe glyph's ink, from `battery_ink` (green charged/charging,
+    /// amber mid, alert red when low, gray when stale).
+    ink: Color32,
+    minutes_remaining: Option<u32>,
+    /// The notification area's icon size in physical pixels at the current
+    /// DPI; Windows reports it, so a display-scaling change redraws.
+    size: u32,
+    /// What fills the square: the battery glyph or the percentage number
+    /// (the control panel's tray-icon style).
+    style: platform::TrayBatteryStyle,
+}
+
+/// The battery glyph's ink, by charge state: green while charging or above
+/// half, amber through the mid band, the alert red at or below the
+/// low-battery threshold, and gray when the reading is stale.
+fn battery_ink(percent: u8, charging: bool, stale: bool, threshold: u8) -> Color32 {
+    use crate::native_ui::{ACCENT, DANGER, MUTED, WARNING};
+    if stale {
+        MUTED
+    } else if charging {
+        ACCENT
+    } else if percent <= threshold {
+        DANGER
+    } else if percent <= 50 {
+        WARNING
+    } else {
+        ACCENT
+    }
+}
+
+/// Renders the live tray icon from a cached battery display: either the
+/// Segoe Fluent battery glyph (the charging variant with the bolt when
+/// plugged in) or the percentage number, per the panel's tray-icon style,
+/// tinted by charge state — green charged/charging, amber mid, red low,
+/// gray stale.
+fn battery_tray_icon(battery: &TrayBattery) -> Result<Icon> {
+    let (rgba, width, height) = platform::battery_icon_rgba(
+        battery.percent,
+        battery.charging,
+        battery.style,
+        battery.size,
+        (battery.ink.r(), battery.ink.g(), battery.ink.b()),
+    )?;
+    Icon::from_rgba(rgba, width, height).context("could not create the battery tray icon")
+}
+
+/// Formats a rough duration for the tooltip: "45 m", "3 h 20 m", "1 d 4 h".
+fn remaining_text(minutes: u32) -> String {
+    let days = minutes / (24 * 60);
+    let hours = minutes % (24 * 60) / 60;
+    let minutes = minutes % 60;
+    if days > 0 {
+        if hours > 0 {
+            format!("{days} d {hours} h")
+        } else {
+            format!("{days} d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours} h {minutes} m")
+        } else {
+            format!("{hours} h")
+        }
+    } else {
+        format!("{minutes} m")
+    }
 }
 
 fn tray_menu_action(open: bool, restart: bool, quit: bool) -> Option<TrayAction> {
@@ -453,6 +567,33 @@ impl TrayState {
         Ok(())
     }
 
+    /// Swaps the tray icon for the live battery display: the battery glyph
+    /// drawn from `battery`'s level, theme, and state colors, with a tooltip
+    /// that spells the percentage out on hover. The previous icon's HICON is
+    /// destroyed by the tray backend when the new one replaces it, so
+    /// redrawing never leaks GDI handles.
+    fn set_battery_display(&mut self, battery: &TrayBattery, tooltip: &str) -> Result<()> {
+        let icon = battery_tray_icon(battery)?;
+        self.icon
+            .set_icon(Some(icon))
+            .context("could not swap in the battery tray icon")?;
+        self.icon
+            .set_tooltip(Some(tooltip.to_owned()))
+            .context("could not update the battery tooltip")?;
+        Ok(())
+    }
+
+    /// Restores the static OpenMouse logo and its plain tooltip.
+    fn set_default_display(&mut self) -> Result<()> {
+        self.icon
+            .set_icon(Some(tray_icon()?))
+            .context("could not restore the OpenMouse tray icon")?;
+        self.icon
+            .set_tooltip(Some("OpenMouse Bridge"))
+            .context("could not restore the tray tooltip")?;
+        Ok(())
+    }
+
     fn next_action(&self) -> Option<TrayAction> {
         self.events.try_recv().ok()
     }
@@ -477,6 +618,9 @@ struct TrayApp {
     keep_running: Arc<AtomicBool>,
     autostart: bool,
     battery_threshold: u8,
+    tray_battery: Option<TrayBattery>,
+    tray_style: platform::TrayBatteryStyle,
+    hybrid_mode: bool,
     automatic_updates: bool,
     notification_sound: bool,
     notification_volume: u8,
@@ -543,6 +687,9 @@ impl TrayApp {
             keep_running,
             autostart: platform::autostart_enabled(),
             battery_threshold: 20,
+            tray_battery: None,
+            tray_style: platform::TrayBatteryStyle::Glyph,
+            hybrid_mode: true,
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 60,
@@ -600,12 +747,83 @@ impl TrayApp {
         while let Ok(snapshot) = self.snapshots.try_recv() {
             self.autostart = snapshot.autostart_enabled;
             self.battery_threshold = snapshot.battery_threshold_percent;
+            self.tray_style =
+                platform::TrayBatteryStyle::from_config_str(&snapshot.tray_battery_style);
+            self.hybrid_mode = snapshot.hybrid_mode;
             self.automatic_updates = snapshot.automatic_updates;
             self.notification_sound = snapshot.notification_sound;
             if !self.adjusting_volume {
                 self.notification_volume = snapshot.notification_volume;
             }
             self.snapshot = Some(snapshot);
+        }
+        self.refresh_tray_battery_display(false);
+    }
+
+    /// Refreshes the tray icon: a live battery glyph showing the mouse's
+    /// charge (or the percentage number, per the panel's tray-icon style)
+    /// while any battery is known, the static OpenMouse logo otherwise.
+    /// Redraws only when the display would change unless `force` — used
+    /// after icon recreation, when the fresh icon is the plain logo again.
+    fn refresh_tray_battery_display(&mut self, force: bool) {
+        let battery = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .batteries
+                .iter()
+                .find(|battery| !battery.stale)
+                .or_else(|| snapshot.batteries.first())
+        });
+        let shown = battery.map(|battery| TrayBattery {
+            device_name: battery.device_name.clone(),
+            percent: battery.percent.min(100),
+            charging: battery.charging,
+            stale: battery.stale,
+            ink: battery_ink(
+                battery.percent.min(100),
+                battery.charging,
+                battery.stale,
+                self.battery_threshold,
+            ),
+            minutes_remaining: battery.minutes_remaining,
+            size: platform::tray_icon_size(),
+            style: self.tray_style,
+        });
+        if !force && shown == self.tray_battery {
+            return;
+        }
+        let outcome = match &shown {
+            Some(battery) => {
+                let status = match (battery.charging, battery.stale) {
+                    (true, _) => " · Charging",
+                    (false, true) => " · Not updating",
+                    (false, false) => "",
+                };
+                // Windows' tooltip buffer tops out at 128 UTF-16 units, and
+                // device names can be long.
+                let eta = battery.minutes_remaining.map(|minutes| {
+                    if battery.charging {
+                        format!("full in {}", remaining_text(minutes))
+                    } else {
+                        format!("{} left", remaining_text(minutes))
+                    }
+                });
+                let tooltip = match eta {
+                    Some(eta) => {
+                        format!(
+                            "{} — {}%{status} · {eta}",
+                            battery.device_name, battery.percent
+                        )
+                    }
+                    None => format!("{} — {}%{status}", battery.device_name, battery.percent),
+                };
+                self.tray
+                    .set_battery_display(battery, &tooltip.chars().take(120).collect::<String>())
+            }
+            None => self.tray.set_default_display(),
+        };
+        match outcome {
+            Ok(()) => self.tray_battery = shown,
+            Err(error) => tracing::warn!(%error, "Could not update the tray battery display"),
         }
     }
 
@@ -768,6 +986,8 @@ impl TrayApp {
         if let Err(error) = self.tray.recreate_icon() {
             tracing::error!(%error, "could not recreate the tray icon after resume");
         }
+        // The fresh icon is the plain logo; put the battery display back.
+        self.refresh_tray_battery_display(true);
     }
 
     fn titlebar(&mut self, ui: &mut egui::Ui) {
@@ -920,6 +1140,19 @@ impl TrayApp {
                         if let Some(rate) = profile.settings.polling_rate_hz { values.push(format!("{rate} Hz")); }
                         if !values.is_empty() { ui.label(RichText::new(format!("Saved: {}", values.join(" · "))).size(12.0).color(MUTED)); }
                     }
+                    // The mouse's own onboard-memory settings, read natively
+                    // wherever its driver can see them — the details someone
+                    // changing DPI or polling rate actually needs, profile or
+                    // no profile.
+                    if let Some(device) = device_summary_battery(self.snapshot.as_ref()) {
+                        let mut values = Vec::new();
+                        if let Some(dpi) = device.dpi { values.push(format!("{dpi} DPI")); }
+                        if let Some(rate) = device.polling_rate_hz { values.push(format!("{rate} Hz")); }
+                        if let Some(mode) = &device.switch_mode { values.push(mode.clone()); }
+                        if !values.is_empty() {
+                            ui.label(RichText::new(format!("Onboard: {}", values.join(" · "))).size(12.0).color(MUTED));
+                        }
+                    }
                     if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.native_automation_error.is_some() || snapshot.pending_native_restores > 0) {
                         ui.label(RichText::new(profile_label(self.snapshot.as_ref())).size(12.0).color(DANGER));
                     }
@@ -966,6 +1199,82 @@ impl TrayApp {
                             }
                             Err(error) => self.last_error = Some(error.to_string()),
                         }
+                    }
+                });
+                ui.add_space(6.0);
+                n::panel(ui, false, 8, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("Device mode")
+                            .size(12.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    let mut enabled = self.hybrid_mode;
+                    if n::switch_row(ui, "Hybrid", &mut enabled)
+                        .on_hover_text(
+                            "While the web panel is closed, Bridge applies the mouse's stored settings and reads the battery itself.",
+                        )
+                        .changed()
+                        && self.send_command(
+                            BridgeCommand::SetHybridMode(enabled),
+                            "Bridge settings service is unavailable",
+                        )
+                    {
+                        self.hybrid_mode = enabled;
+                    }
+                    ui.label(
+                        RichText::new(if self.hybrid_mode {
+                            "While the web panel is closed, Bridge applies the mouse's \
+                             stored settings and reads the battery itself"
+                        } else {
+                            "Only the web panel changes the mouse"
+                        })
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    divider(ui);
+                    let mut selected_style = self.tray_style;
+                    row(ui, "Battery display", |ui| {
+                        let choice = egui::ComboBox::from_id_salt("tray-battery-style")
+                            .width(110.0)
+                            .selected_text(
+                                RichText::new(match self.tray_style {
+                                    platform::TrayBatteryStyle::Glyph => "Battery glyph",
+                                    platform::TrayBatteryStyle::Percentage => "Percentage",
+                                })
+                                .size(12.0),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut selected_style,
+                                    platform::TrayBatteryStyle::Glyph,
+                                    "Battery glyph",
+                                );
+                                ui.selectable_value(
+                                    &mut selected_style,
+                                    platform::TrayBatteryStyle::Percentage,
+                                    "Percentage",
+                                );
+                            });
+                        choice.response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::ComboBox,
+                                ui.is_enabled(),
+                                "Battery display",
+                            )
+                        });
+                    });
+                    if selected_style != self.tray_style
+                        && self.send_command(
+                            BridgeCommand::SetTrayBatteryStyle(selected_style),
+                            "Bridge settings service is unavailable",
+                        )
+                    {
+                        self.tray_style = selected_style;
+                        // Redraw the tray at once; the service's next snapshot
+                        // only confirms what is already on screen.
+                        self.refresh_tray_battery_display(true);
                     }
                 });
                 ui.add_space(6.0);
@@ -1238,11 +1547,13 @@ impl TrayApp {
             .as_ref()
             .and_then(|s| s.active_profile.as_ref())
             .is_some_and(|p| p.settings.dpi.is_some() || p.settings.polling_rate_hz.is_some());
+        let has_summary = device_summary_battery(self.snapshot.as_ref()).is_some();
         let height = panel_height(
             self.view,
             self.details_open,
             has_values,
             update_is_notice(&self.update_state),
+            has_summary,
         );
         if height != self.requested_height {
             let origin = context
@@ -1627,6 +1938,19 @@ fn run_server(
                             }
                         }
                     }
+                    BridgeCommand::SetHybridMode(enabled) => {
+                        if let Err(error) = command_service.set_hybrid_mode(enabled).await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
+                    BridgeCommand::SetTrayBatteryStyle(style) => {
+                        if let Err(error) = command_service
+                            .set_tray_battery_style(style.as_config_str())
+                            .await
+                        {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
                     BridgeCommand::CheckForUpdates => {
                         check_for_updates(false, &update_events).await;
                     }
@@ -1974,17 +2298,25 @@ mod tests {
 
     #[test]
     fn content_growth_stays_bounded_and_settings_has_its_own_budget() {
-        assert_eq!(panel_height(View::Home, false, false, false), 280.0);
-        assert_eq!(panel_height(View::Home, false, true, false), 298.0);
-        assert_eq!(panel_height(View::Home, false, true, true), 338.0);
-        assert_eq!(panel_height(View::Home, true, false, false), 340.0);
-        assert_eq!(panel_height(View::Settings, true, true, true), 420.0);
+        assert_eq!(panel_height(View::Home, false, false, false, false), 280.0);
+        assert_eq!(panel_height(View::Home, false, true, false, false), 298.0);
+        assert_eq!(panel_height(View::Home, false, true, true, false), 338.0);
+        assert_eq!(panel_height(View::Home, true, false, false, false), 340.0);
+        assert_eq!(panel_height(View::Settings, true, true, true, false), 420.0);
+    }
+
+    #[test]
+    fn device_summary_rows_grow_the_home_view() {
+        assert_eq!(panel_height(View::Home, false, false, false, true), 302.0);
+        assert_eq!(panel_height(View::Home, false, true, false, true), 320.0);
+        // The details view scrolls, so its budget stays fixed.
+        assert_eq!(panel_height(View::Home, true, false, false, true), 340.0);
     }
 
     #[test]
     fn idle_window_is_a_compact_companion_not_a_settings_sheet() {
         assert_eq!(WINDOW_WIDTH, 360.0);
-        assert!(panel_height(View::Home, false, false, false) <= 340.0);
+        assert!(panel_height(View::Home, false, false, false, false) <= 340.0);
     }
 
     #[test]
@@ -2025,6 +2357,9 @@ mod tests {
             games: vec![],
             tracked_game_count: 0,
             battery_threshold_percent: 20,
+            tray_battery_style: "glyph".to_owned(),
+            hybrid_mode: true,
+            device_mode: "onboard".to_owned(),
             autostart_enabled: false,
             automatic_updates: false,
             notification_sound: true,
@@ -2053,6 +2388,10 @@ mod tests {
                 percent: 60,
                 charging: false,
                 stale: true,
+                minutes_remaining: None,
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
             });
         assert_eq!(device_label(Some(&snapshot)), "No mouse session");
     }
@@ -2079,6 +2418,10 @@ mod tests {
             percent: 60,
             charging: true,
             stale: true,
+            minutes_remaining: None,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
         };
         assert_eq!(battery_text(&battery), "60% · Last known (was charging)");
     }
@@ -2162,6 +2505,10 @@ mod tests {
             percent: 42,
             charging: false,
             stale: false,
+            minutes_remaining: None,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
         };
         assert_eq!(battery_text(&battery), "42%");
         battery.charging = true;
